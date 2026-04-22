@@ -2,8 +2,7 @@ import Phaser from "phaser";
 import { Client, Room, getStateCallbacks } from "colyseus.js";
 
 // ---------------------------------------------------------------------------
-// Global error surface — if anything throws, we want to SEE it, not get a
-// silently black viewport. Runs before anything else.
+// Error banner (runs before anything else) so we never silent-fail again.
 // ---------------------------------------------------------------------------
 const errBanner = (() => {
   const el = document.getElementById("err-banner");
@@ -17,27 +16,17 @@ const errBanner = (() => {
 })();
 window.addEventListener("error", (e) => {
   errBanner.show("[error]", `${e.message}\n${e.error?.stack || ""}`);
-  // eslint-disable-next-line no-console
   console.error("[tallinn]", e.error || e.message);
 });
-window.addEventListener("unhandledrejection", (e) => {
+window.addEventListener("unhandledrejection", (e: any) => {
   errBanner.show("[unhandled promise]", `${e.reason?.message || e.reason}\n${e.reason?.stack || ""}`);
 });
+
 import {
-  generateMap,
-  generateBuildings,
-  MAP_W,
-  MAP_H,
-  TILE_SIZE,
-  T,
-  isSolid,
-  PLAYER_SIZE,
-  PLAYER_WALK_SPEED,
-  PLAYER_SPRINT_SPEED,
-  STAMINA_MAX,
-  STAMINA_DRAIN,
-  STAMINA_REGEN,
-  rankFor,
+  generateMap, generateBuildings, MAP_W, MAP_H, TILE_SIZE, T, isSolid,
+  isSafeTile, SAFE_ZONE,
+  PLAYER_SIZE, PLAYER_WALK_SPEED, PLAYER_SPRINT_SPEED,
+  STAMINA_MAX, STAMINA_DRAIN, STAMINA_REGEN,
   type Building,
 } from "./shared/map";
 
@@ -51,10 +40,14 @@ const errEl = document.getElementById("err") as HTMLDivElement;
 
 const hud = document.getElementById("hud") as HTMLDivElement;
 const scoreCard = document.getElementById("score-card") as HTMLDivElement;
-const orderCard = document.getElementById("order-card") as HTMLDivElement;
-const leaderboard = document.getElementById("leaderboard") as HTMLDivElement;
+const hpWrap = document.getElementById("hp-wrap") as HTMLDivElement;
+const hpBar = document.getElementById("hp-bar") as HTMLDivElement;
+const hpText = document.getElementById("hp-text") as HTMLDivElement;
 const stamBarEl = document.getElementById("stamina-bar") as HTMLDivElement;
 const staminaWrap = document.getElementById("stamina-wrap") as HTMLDivElement;
+const equipPanel = document.getElementById("equip-panel") as HTMLDivElement;
+const packPanel = document.getElementById("pack-panel") as HTMLDivElement;
+const leaderboard = document.getElementById("leaderboard") as HTMLDivElement;
 
 const chatWrap = document.getElementById("chat") as HTMLDivElement;
 const chatLog = document.getElementById("chat-log") as HTMLDivElement;
@@ -65,10 +58,6 @@ const minimap = document.getElementById("minimap") as HTMLCanvasElement;
 nameInput.value = localStorage.getItem("tallinn.name") || "";
 nameInput.focus();
 nameInput.addEventListener("keydown", (e) => { if (e.key === "Enter") playBtn.click(); });
-
-const bestScoreKey = "tallinn.best";
-function getBestScore(): number { return Number(localStorage.getItem(bestScoreKey) || 0); }
-function setBestScore(n: number) { localStorage.setItem(bestScoreKey, String(n)); }
 
 playBtn.addEventListener("click", async () => {
   const name = (nameInput.value || "").trim().slice(0, 16) || `guest-${Math.floor(Math.random() * 999)}`;
@@ -82,6 +71,9 @@ playBtn.addEventListener("click", async () => {
     scoreCard.style.display = "block";
     leaderboard.style.display = "block";
     staminaWrap.style.display = "block";
+    hpWrap.style.display = "block";
+    equipPanel.style.display = "block";
+    packPanel.style.display = "block";
     chatWrap.style.display = "block";
     minimap.style.display = "block";
   } catch (err: any) {
@@ -104,28 +96,16 @@ async function connect(name: string) {
   room = await client.joinOrCreate("tallinn", { name });
   selfId = room.sessionId;
 
-  // Chat + server events.
   room.onMessage("chat", (m: { from: string; text: string; kind?: string }) => addChatLine(m.from, m.text, m.kind));
-  room.onMessage("order_new", (m: any) => addChatLine("🧭", `Uus tellimus: ${m.from} → ${m.to} · ${m.item} · +${m.reward}`, "system"));
-  room.onMessage("order_pickup", (m: any) => {
-    if (m.playerId === selfId) {
-      addChatLine("📦", `Võtsid tellimuse: vii ${m.item} → ${m.to}`, "system-good");
-    }
+  room.onMessage("fx", (m: any) => {
+    pendingFx.push({ ...m, at: performance.now() });
+    if (pendingFx.length > 40) pendingFx.shift();
   });
-  room.onMessage("order_delivered", (m: any) => {
-    addChatLine(m.playerId === selfId ? "💰" : "🪙",
-      `${m.playerName} toimetas ${m.item} → ${m.to} · +${m.payout} marka${m.combo > 1 ? ` · x${m.combo} combo!` : ""}`,
-      m.playerId === selfId ? "system-good" : "system");
-    if (m.playerId === selfId) {
-      pendingDeliveryEffect = { payout: m.payout, combo: m.combo };
-    }
-  });
-  room.onMessage("order_expired", (m: any) => addChatLine("⏱", `Tellimus aegus: ${m.item} juures ${m.fromNpc}`, "system-bad"));
 
   new Phaser.Game({
     type: Phaser.AUTO,
     parent: "app",
-    backgroundColor: "#120e0a",
+    backgroundColor: "#0f0b08",
     scale: {
       mode: Phaser.Scale.RESIZE,
       width: window.innerWidth,
@@ -150,8 +130,9 @@ function escapeHtml(s: string) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-// Cross-scene queue for juice effects triggered by server events.
-let pendingDeliveryEffect: { payout: number; combo: number } | null = null;
+// Queue of server-originated FX to animate client-side.
+interface Fx { t: string; x: number; y: number; amount?: number; name?: string; at: number; }
+const pendingFx: Fx[] = [];
 
 // ---------------------------------------------------------------------------
 // Visual palettes
@@ -177,39 +158,42 @@ const TILE_BASE_COLORS: Record<number, number> = {
   [T.CASTLE_WALL]: 0x3a3027,
 };
 
-// role → small hat / color hint for NPCs
-const NPC_STYLE: Record<string, { body: number; hat: number }> = {
-  baker:      { body: 0xd2a56a, hat: 0xe9cf9a },
-  smith:      { body: 0x5a4538, hat: 0x3a2e25 },
-  apothecary: { body: 0x7b4a6a, hat: 0xc6a7be },
-  scribe:     { body: 0x3e4a73, hat: 0x2b3558 },
-  brewer:     { body: 0x8e6b3a, hat: 0xc49766 },
-  tanner:     { body: 0x6f4a32, hat: 0x3b2a1c },
-  weaver:     { body: 0x9a7c4a, hat: 0xdcbf8e },
-  fisherman:  { body: 0x3a5a68, hat: 0xc7a86b },
-  crier:      { body: 0xb4463b, hat: 0xe7c258 },
-  guard:      { body: 0x4a5054, hat: 0x8a8f93 },
-  priest:     { body: 0x2a2a30, hat: 0xc8a14a },
+const RARITY_COLORS: Record<string, string> = {
+  common: "#c7b99a",
+  uncommon: "#7fc17a",
+  rare: "#7eb8ff",
+  epic: "#c89bff",
+};
+const RARITY_HEX: Record<string, number> = {
+  common: 0xc7b99a, uncommon: 0x7fc17a, rare: 0x7eb8ff, epic: 0xc89bff,
+};
+
+const ENEMY_STYLE: Record<string, { body: number; hat: number; size: number }> = {
+  revenant: { body: 0x6a6a5a, hat: 0x3a2418, size: 20 },
+  bandit:   { body: 0x5a4538, hat: 0x2a1c10, size: 22 },
+  archer:   { body: 0x3a5a40, hat: 0x283a22, size: 22 },
+  rival:    { body: 0x6a3838, hat: 0x2a1520, size: 24 },
+  elite:    { body: 0x4a3028, hat: 0xc8a14a, size: 28 },
+  merchant: { body: 0x7b6a58, hat: 0x3a2a20, size: 22 },
 };
 
 // ---------------------------------------------------------------------------
 // GameScene
 // ---------------------------------------------------------------------------
 class GameScene extends Phaser.Scene {
-  private map: number[][] = generateMap();
+  private map = generateMap();
   private buildings: Building[] = generateBuildings();
 
-  private keys!: Record<"up" | "down" | "left" | "right" | "w" | "a" | "s" | "d" | "shift", Phaser.Input.Keyboard.Key>;
+  private keys!: Record<"up"|"down"|"left"|"right"|"w"|"a"|"s"|"d"|"shift"|"space"|"e"|"q", Phaser.Input.Keyboard.Key>;
+  private mouseDown = false;
+  private lastAim = 0;
 
   private selfContainer!: Phaser.GameObjects.Container;
   private selfBody!: Phaser.GameObjects.Rectangle;
-  private selfEye1!: Phaser.GameObjects.Rectangle;
-  private selfEye2!: Phaser.GameObjects.Rectangle;
   private selfHem!: Phaser.GameObjects.Rectangle;
   private selfShadow!: Phaser.GameObjects.Ellipse;
-  private selfPackage!: Phaser.GameObjects.Rectangle;
   private selfLabel!: Phaser.GameObjects.Text;
-  private selfSprintFx!: Phaser.GameObjects.Ellipse;
+  private selfSwingGfx!: Phaser.GameObjects.Graphics;
 
   private selfPredicted = { x: 0, y: 0 };
   private selfStamina = 1;
@@ -219,106 +203,133 @@ class GameScene extends Phaser.Scene {
   private remotes = new Map<string, {
     container: Phaser.GameObjects.Container;
     body: Phaser.GameObjects.Rectangle;
-    pack: Phaser.GameObjects.Rectangle;
     label: Phaser.GameObjects.Text;
-    buffer: Array<{ t: number; x: number; y: number; facing: number; sprinting: boolean; carrying: boolean }>;
+    hpBar: Phaser.GameObjects.Graphics;
+    swingGfx: Phaser.GameObjects.Graphics;
+    buffer: Array<{ t: number; x: number; y: number; facing: number; hp: number; hpMax: number; aim: number; attackEnd: number; deadUntil: number }>;
     color: string;
     name: string;
   }>();
 
-  // NPC rendering
-  private npcVisuals = new Map<string, {
+  private enemies = new Map<string, {
+    kind: string;
     container: Phaser.GameObjects.Container;
-    ring: Phaser.GameObjects.Arc;        // pulsing "!" attention ring when has order
-    bang: Phaser.GameObjects.Text;
-    nameTag: Phaser.GameObjects.Text;
-    role: string;
+    body: Phaser.GameObjects.Rectangle;
+    label: Phaser.GameObjects.Text;
+    hpBar: Phaser.GameObjects.Graphics;
+    x: number; y: number; hp: number; hpMax: number; hitFlashUntil: number; deadFade: number;
   }>();
 
-  private waypointArrow!: Phaser.GameObjects.Container;
-  private waypointGraphics!: Phaser.GameObjects.Graphics;
-  private waypointLabel!: Phaser.GameObjects.Text;
+  private lootBags = new Map<string, {
+    container: Phaser.GameObjects.Container;
+    label: Phaser.GameObjects.Text | null;
+  }>();
 
-  // day/night tint
+  private projectiles = new Map<string, Phaser.GameObjects.Rectangle>();
+
   private dayTint!: Phaser.GameObjects.Rectangle;
-
-  private selfFootStepPhase = 0; // for bob
+  private selfFootStepPhase = 0;
+  private safeHighlight!: Phaser.GameObjects.Graphics;
 
   constructor() { super({ key: "GameScene" }); }
 
-  // =======================================================================
   create() {
-    try {
-      this.createInner();
-    } catch (err: any) {
-      errBanner.show("[create]", `${err?.message || err}\n${err?.stack || ""}`);
-      throw err;
-    }
+    try { this.createInner(); }
+    catch (err: any) { errBanner.show("[create]", `${err?.message}\n${err?.stack || ""}`); throw err; }
   }
 
   private createInner() {
     const worldPxW = MAP_W * TILE_SIZE;
     const worldPxH = MAP_H * TILE_SIZE;
 
-    // 1. Render the static world once into a cached texture, then display as Image.
-    //    This avoids relying on the deprecated RenderTexture game-object path.
     this.drawWorldInto(worldPxW, worldPxH);
 
-    // 2. Cache NPC defs but wait for state for exact positions.
-    //    (NPCs are server-authoritative; they'll be created via onAdd.)
+    // Safe-zone highlight overlay (subtle gold glow)
+    this.safeHighlight = this.add.graphics().setDepth(1);
+    const sx = SAFE_ZONE.x0 * TILE_SIZE, sy = SAFE_ZONE.y0 * TILE_SIZE;
+    const sw = (SAFE_ZONE.x1 - SAFE_ZONE.x0 + 1) * TILE_SIZE;
+    const sh = (SAFE_ZONE.y1 - SAFE_ZONE.y0 + 1) * TILE_SIZE;
+    this.safeHighlight.lineStyle(2, 0xf4d58d, 0.28);
+    this.safeHighlight.strokeRoundedRect(sx, sy, sw, sh, 4);
+    this.safeHighlight.fillStyle(0xf4d58d, 0.05);
+    this.safeHighlight.fillRect(sx, sy, sw, sh);
 
-    // 3. Camera bounds.
+    // Camera
     this.cameras.main.setBounds(0, 0, worldPxW, worldPxH);
     this.cameras.main.setZoom(1.6);
-    this.cameras.main.setBackgroundColor(0x120e0a);
+    this.cameras.main.setBackgroundColor(0x0f0b08);
     this.cameras.main.roundPixels = true;
 
-    // 4. Day/night tint layer — follows the camera, covers viewport.
+    // Day tint overlay
     this.dayTint = this.add.rectangle(0, 0, worldPxW, worldPxH, 0x000020, 0)
       .setOrigin(0, 0).setDepth(1000).setScrollFactor(0);
     this.dayTint.setSize(window.innerWidth, window.innerHeight);
 
-    // 5. Input.
+    // Input
     const kb = this.input.keyboard!;
     this.keys = {
       up: kb.addKey("UP"), down: kb.addKey("DOWN"),
       left: kb.addKey("LEFT"), right: kb.addKey("RIGHT"),
       w: kb.addKey("W"), a: kb.addKey("A"), s: kb.addKey("S"), d: kb.addKey("D"),
       shift: kb.addKey("SHIFT"),
+      space: kb.addKey("SPACE"),
+      e: kb.addKey("E"),
+      q: kb.addKey("Q"),
     };
 
-    // 6. Self sprite (built once, updated each frame).
-    this.selfContainer = this.add.container(0, 0);
-    this.selfShadow = this.add.ellipse(PLAYER_SIZE / 2, PLAYER_SIZE - 1, PLAYER_SIZE * 0.9, 6, 0x000000, 0.45);
-    this.selfSprintFx = this.add.ellipse(PLAYER_SIZE / 2, PLAYER_SIZE, PLAYER_SIZE * 1.2, 5, 0xfff0c0, 0.3)
-      .setVisible(false);
-    this.selfBody = this.add.rectangle(0, 0, PLAYER_SIZE, PLAYER_SIZE, 0xffffff)
-      .setStrokeStyle(1, 0x1a1108, 1).setOrigin(0, 0);
-    this.selfEye1 = this.add.rectangle(6, 7, 3, 3, 0x1a1108).setOrigin(0, 0);
-    this.selfEye2 = this.add.rectangle(13, 7, 3, 3, 0x1a1108).setOrigin(0, 0);
-    this.selfHem = this.add.rectangle(0, PLAYER_SIZE - 4, PLAYER_SIZE, 4, 0x000000, 0.4).setOrigin(0, 0);
-    this.selfPackage = this.add.rectangle(PLAYER_SIZE / 2, -4, 12, 10, 0xd8c58a)
-      .setStrokeStyle(1, 0x5a3a22).setOrigin(0.5, 0).setVisible(false);
-    this.selfContainer.add([
-      this.selfShadow, this.selfSprintFx, this.selfBody, this.selfEye1, this.selfEye2, this.selfHem, this.selfPackage
-    ]);
-    this.selfContainer.setDepth(101);
+    this.input.mouse?.disableContextMenu();
+    this.input.on("pointerdown", (pt: Phaser.Input.Pointer) => {
+      if (!room) return;
+      if (document.activeElement === chatInput) return;
+      if (pt.rightButtonDown()) {
+        room.send("dash", { aim: this.computeAim(pt) });
+      } else {
+        room.send("attack", { aim: this.computeAim(pt) });
+      }
+      this.mouseDown = true;
+    });
+    this.input.on("pointerup", () => { this.mouseDown = false; });
 
-    this.selfLabel = this.add.text(0, 0, "", {
-      fontFamily: "monospace", fontSize: "12px", color: "#fff",
-      stroke: "#000", strokeThickness: 3,
-    }).setOrigin(0.5, 1).setDepth(210);
+    // Space = attack in facing direction / Shift= dash  (alternate keybinds)
+    this.keys.space.on("down", () => {
+      if (!room) return;
+      if (document.activeElement === chatInput) return;
+      room.send("attack", { aim: this.computeAim(this.input.activePointer) });
+    });
+    this.keys.e.on("down", () => {
+      if (!room || document.activeElement === chatInput) return;
+      // Equip first compatible item in pack.
+      const self = this.getSelf(); if (!self) return;
+      for (let i = 0; i < self.pack.length; i++) {
+        const it = self.pack.at(i);
+        if (it && (it.slot === "weapon" || it.slot === "armor" || it.slot === "ring")) {
+          room.send("equip", i); return;
+        }
+      }
+    });
+    this.keys.q.on("down", () => {
+      if (!room || document.activeElement === chatInput) return;
+      const self = this.getSelf(); if (!self) return;
+      for (let i = 0; i < self.pack.length; i++) {
+        const it = self.pack.at(i);
+        if (it && it.slot === "consumable") { room!.send("use", i); return; }
+      }
+    });
 
-    // 7. Waypoint arrow (depth above world).
-    this.waypointArrow = this.add.container(0, 0).setScrollFactor(0).setDepth(500).setVisible(false);
-    this.waypointGraphics = this.add.graphics();
-    this.waypointLabel = this.add.text(0, 20, "", {
-      fontFamily: "monospace", fontSize: "10px", color: "#1a1108",
-      backgroundColor: "#e9c46a", padding: { x: 4, y: 2 },
-    }).setOrigin(0.5, 0);
-    this.waypointArrow.add([this.waypointGraphics, this.waypointLabel]);
+    // 1..8 = equip/use pack slot
+    for (let i = 1; i <= 8; i++) {
+      const k = kb.addKey(String(i));
+      k.on("down", () => {
+        if (!room || document.activeElement === chatInput) return;
+        const self = this.getSelf(); if (!self) return;
+        const it = self.pack.at(i - 1);
+        if (!it) return;
+        if (it.slot === "consumable") room!.send("use", i - 1);
+        else room!.send("equip", i - 1);
+      });
+    }
 
-    // 8. Chat input toggle.
+    // Chat
     window.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
         if (chatInput.style.display === "none" || !chatInput.style.display) {
@@ -333,30 +344,37 @@ class GameScene extends Phaser.Scene {
       }
     });
 
-    // 9. Resize handling for day tint.
     this.scale.on("resize", (size: Phaser.Structs.Size) => {
       this.dayTint.setSize(size.width, size.height);
     });
 
-    // 10. Hook Colyseus schema callbacks.
+    // Self sprite
+    this.selfContainer = this.add.container(0, 0).setDepth(101);
+    this.selfShadow = this.add.ellipse(PLAYER_SIZE / 2, PLAYER_SIZE - 1, PLAYER_SIZE * 0.9, 6, 0x000000, 0.45);
+    this.selfBody = this.add.rectangle(0, 0, PLAYER_SIZE, PLAYER_SIZE, 0xffffff)
+      .setStrokeStyle(1, 0x1a1108, 1).setOrigin(0, 0);
+    this.selfHem = this.add.rectangle(0, PLAYER_SIZE - 4, PLAYER_SIZE, 4, 0x000000, 0.4).setOrigin(0, 0);
+    this.selfContainer.add([this.selfShadow, this.selfBody, this.selfHem]);
+    this.selfLabel = this.add.text(0, 0, "", {
+      fontFamily: "monospace", fontSize: "12px", color: "#fff",
+      stroke: "#000", strokeThickness: 3,
+    }).setOrigin(0.5, 1).setDepth(210);
+    this.selfSwingGfx = this.add.graphics().setDepth(105);
+
     if (!room) return;
     const $ = getStateCallbacks(room);
-    if (!$) {
-      console.error("[tallinn] state callbacks unavailable");
-      return;
-    }
+    if (!$) { errBanner.show("[schema]", "no getStateCallbacks proxy"); return; }
 
-    // Players.
+    // Players
     $(room.state as any).players.onAdd((player: any, sid: string) => {
       if (sid === selfId) {
-        this.selfPredicted.x = player.x;
-        this.selfPredicted.y = player.y;
+        this.selfPredicted.x = player.x; this.selfPredicted.y = player.y;
         this.selfStamina = player.stamina;
         this.selfBody.fillColor = Phaser.Display.Color.HexStringToColor(player.color).color;
         this.selfLabel.setText(player.name);
         this.selfContainer.setPosition(player.x, player.y);
         this.cameras.main.centerOn(player.x + PLAYER_SIZE / 2, player.y + PLAYER_SIZE / 2);
-        this.cameras.main.startFollow(this.selfContainer, true, 0.15, 0.15);
+        this.cameras.main.startFollow(this.selfContainer, true, 0.18, 0.18);
       } else {
         this.addRemote(sid, player);
       }
@@ -364,14 +382,13 @@ class GameScene extends Phaser.Scene {
         if (sid === selfId) {
           this.selfStamina = player.stamina;
           this.reconcile(player.x, player.y, player.lastProcessedInput);
-          this.selfPackage.setVisible(!!player.carryingOrderId);
         } else {
           const r = this.remotes.get(sid);
           if (r) {
             r.buffer.push({
-              t: performance.now(),
-              x: player.x, y: player.y, facing: player.facing,
-              sprinting: player.sprinting, carrying: !!player.carryingOrderId,
+              t: performance.now(), x: player.x, y: player.y, facing: player.facing,
+              hp: player.hp, hpMax: player.hpMax, aim: player.aimAngle,
+              attackEnd: player.attackEnd, deadUntil: player.deadUntil,
             });
             if (r.buffer.length > 30) r.buffer.shift();
           }
@@ -380,28 +397,65 @@ class GameScene extends Phaser.Scene {
     });
     $(room.state as any).players.onRemove((_p: any, sid: string) => {
       const r = this.remotes.get(sid);
-      if (r) { r.container.destroy(); r.label.destroy(); this.remotes.delete(sid); }
+      if (r) { r.container.destroy(); r.label.destroy(); r.hpBar.destroy(); r.swingGfx.destroy(); this.remotes.delete(sid); }
     });
 
-    // NPCs.
-    $(room.state as any).npcs.onAdd((npc: any, id: string) => {
-      this.spawnNpc(npc, id);
-      $(npc).onChange(() => {
-        const v = this.npcVisuals.get(id);
-        if (!v) return;
-        const hasOrder = !!npc.activeOrderId;
-        v.ring.setVisible(hasOrder);
-        v.bang.setVisible(hasOrder);
+    // Enemies
+    $(room.state as any).enemies.onAdd((e: any, id: string) => {
+      this.spawnEnemyVisual(e, id);
+      $(e).onChange(() => {
+        const v = this.enemies.get(id); if (!v) return;
+        v.x = e.x; v.y = e.y; v.hp = e.hp; v.hpMax = e.hpMax; v.hitFlashUntil = e.hitFlashUntil;
+        v.container.setPosition(Math.round(e.x - ENEMY_STYLE[v.kind]?.size / 2), Math.round(e.y - ENEMY_STYLE[v.kind]?.size / 2));
+        v.label.setPosition(e.x, e.y + 14);
+        if (e.state === "dead") v.deadFade = performance.now();
       });
     });
-    $(room.state as any).npcs.onRemove((_n: any, id: string) => {
-      const v = this.npcVisuals.get(id);
-      if (v) { v.container.destroy(); v.nameTag.destroy(); this.npcVisuals.delete(id); }
+    $(room.state as any).enemies.onRemove((_e: any, id: string) => {
+      const v = this.enemies.get(id);
+      if (v) { v.container.destroy(); v.label.destroy(); v.hpBar.destroy(); this.enemies.delete(id); }
     });
 
-    // Orders — pop toast on pickup, floater on deliver, flash on expire.
-    $(room.state as any).orders.onAdd((_o: any, _id: string) => { /* listener above via order_new message */ });
-    $(room.state as any).orders.onRemove((_o: any, _id: string) => { /* ditto */ });
+    // Loot bags
+    $(room.state as any).loot.onAdd((bag: any, id: string) => {
+      this.spawnLootVisual(bag, id);
+    });
+    $(room.state as any).loot.onRemove((_bag: any, id: string) => {
+      const l = this.lootBags.get(id);
+      if (l) { l.container.destroy(); l.label?.destroy(); this.lootBags.delete(id); }
+    });
+
+    // Projectiles
+    $(room.state as any).projectiles.onAdd((pr: any, id: string) => {
+      const rect = this.add.rectangle(pr.x, pr.y, 10, 3, 0xeeeeaa).setStrokeStyle(1, 0x2a1a10).setDepth(105);
+      this.projectiles.set(id, rect);
+      $(pr).onChange(() => {
+        const r = this.projectiles.get(id); if (!r) return;
+        r.setPosition(pr.x, pr.y);
+        r.rotation = Math.atan2(pr.vy, pr.vx);
+      });
+    });
+    $(room.state as any).projectiles.onRemove((_pr: any, id: string) => {
+      const r = this.projectiles.get(id); if (r) { r.destroy(); this.projectiles.delete(id); }
+    });
+  }
+
+  // =======================================================================
+  private computeAim(pt: Phaser.Input.Pointer): number {
+    const cam = this.cameras.main;
+    const wx = pt.x / cam.zoom + cam.scrollX;
+    const wy = pt.y / cam.zoom + cam.scrollY;
+    const cx = this.selfPredicted.x + PLAYER_SIZE / 2;
+    const cy = this.selfPredicted.y + PLAYER_SIZE / 2;
+    const a = Math.atan2(wy - cy, wx - cx);
+    this.lastAim = a;
+    return a;
+  }
+
+  private getSelf(): any {
+    const state: any = room?.state;
+    if (!state?.players?.get) return null;
+    return state.players.get(selfId);
   }
 
   // =======================================================================
@@ -414,11 +468,15 @@ class GameScene extends Phaser.Scene {
   private updateInner(deltaMs: number) {
     if (!room) return;
     const dt = Math.min(0.05, deltaMs / 1000);
+    const now = performance.now();
 
-    // --- Input gathering ---
+    const self = this.getSelf();
+    const dead = !!self?.deadUntil;
+
+    // Input
     const isTyping = document.activeElement === nameInput || document.activeElement === chatInput;
     let up = false, down = false, left = false, right = false, sprint = false;
-    if (!isTyping) {
+    if (!isTyping && !dead) {
       up = this.keys.up.isDown || this.keys.w.isDown;
       down = this.keys.down.isDown || this.keys.s.isDown;
       left = this.keys.left.isDown || this.keys.a.isDown;
@@ -426,726 +484,143 @@ class GameScene extends Phaser.Scene {
       sprint = this.keys.shift.isDown;
     }
 
-    // --- Local prediction ---
+    // Prediction
     let dx = 0, dy = 0;
     if (left) dx -= 1; if (right) dx += 1;
-    if (up) dy -= 1;   if (down) dy += 1;
+    if (up) dy -= 1; if (down) dy += 1;
     if (dx !== 0 && dy !== 0) { const inv = 1 / Math.sqrt(2); dx *= inv; dy *= inv; }
 
-    const carrying = this.selfPackage.visible;
     const wantSprint = sprint && (dx !== 0 || dy !== 0);
     let speed = PLAYER_WALK_SPEED;
     if (wantSprint && this.selfStamina > 0.02) {
       speed = PLAYER_SPRINT_SPEED;
       this.selfStamina = Math.max(0, this.selfStamina - STAMINA_DRAIN * dt);
-    } else {
-      this.selfStamina = Math.min(STAMINA_MAX, this.selfStamina + STAMINA_REGEN * dt);
+    } else this.selfStamina = Math.min(STAMINA_MAX, this.selfStamina + STAMINA_REGEN * dt);
+    if (self?.pack && self.pack.length > 0) speed *= 0.93;
+
+    if (!dead) {
+      const stepX = dx * speed * dt;
+      const stepY = dy * speed * dt;
+      let nx = this.selfPredicted.x + stepX;
+      if (!this.collidesAt(nx, this.selfPredicted.y)) this.selfPredicted.x = nx;
+      let ny = this.selfPredicted.y + stepY;
+      if (!this.collidesAt(this.selfPredicted.x, ny)) this.selfPredicted.y = ny;
+
+      const input = { seq: this.nextSeq++, up, down, left, right, sprint: wantSprint && this.selfStamina > 0.02, dt };
+      this.pendingInputs.push(input);
+      room.send("input", input);
     }
-    if (carrying) speed *= 0.92;
 
-    const stepX = dx * speed * dt;
-    const stepY = dy * speed * dt;
-    let nx = this.selfPredicted.x + stepX;
-    if (!this.collidesAt(nx, this.selfPredicted.y)) this.selfPredicted.x = nx;
-    let ny = this.selfPredicted.y + stepY;
-    if (!this.collidesAt(this.selfPredicted.x, ny)) this.selfPredicted.y = ny;
+    // Continuous attack while mouse held (capped by server cooldown)
+    if (this.mouseDown && !isTyping && !dead && (now % 50 < 16)) {
+      room.send("attack", { aim: this.computeAim(this.input.activePointer) });
+    }
 
-    const input = { seq: this.nextSeq++, up, down, left, right, sprint: wantSprint && this.selfStamina > 0.02, dt };
-    this.pendingInputs.push(input);
-    room.send("input", input);
+    // Self render
+    this.renderSelf(dx, dy, wantSprint, dt, self);
 
-    // --- Self visuals ---
-    this.renderSelf(dx, dy, wantSprint, dt);
-
-    // --- Remote interpolation (~100ms behind) ---
+    // Remote render + HP bars + swing effects
     this.renderRemotes();
 
-    // --- NPC idle animation (bang pulse) ---
-    for (const [, v] of this.npcVisuals) {
-      if (v.bang.visible) {
-        const s = 1 + 0.15 * Math.sin(performance.now() / 180);
-        v.bang.setScale(s);
-        v.ring.setScale(1 + 0.12 * Math.sin(performance.now() / 240));
-      }
-    }
+    // Enemy visuals
+    this.renderEnemies();
 
-    // --- Waypoint arrow ---
-    this.updateWaypoint();
+    // HUD / UI
+    this.renderHud(self);
+    this.renderEquip(self);
+    this.renderPack(self);
 
-    // --- Day/night tint ---
-    const phase = (room.state as any).dayPhase ?? 0.3;
-    const darkness = 0.5 * (1 - Math.cos(phase * Math.PI * 2)) * 0.35; // 0 .. ~0.175
-    this.dayTint.setFillStyle(0x10183a, darkness);
+    // FX queue (hit numbers etc.)
+    this.drainFx();
 
-    // --- HUD ---
-    this.renderHud();
-
-    // --- Delivery juice (queued from server events) ---
-    if (pendingDeliveryEffect) {
-      const e = pendingDeliveryEffect; pendingDeliveryEffect = null;
-      this.burstCoinsAt(this.selfPredicted.x + PLAYER_SIZE / 2, this.selfPredicted.y + PLAYER_SIZE / 2);
-      this.floatText(this.selfPredicted.x + PLAYER_SIZE / 2, this.selfPredicted.y - 4,
-        `+${e.payout}${e.combo > 1 ? `  ×${e.combo}` : ""}`, e.combo > 1 ? "#ffd166" : "#e9c46a", 16 + e.combo * 2);
-      this.cameras.main.shake(180, 0.003 + e.combo * 0.0008);
-      if (e.combo > 1) this.screenFlash("#e9c46a", 180);
-      this.drawMinimap();
-    }
+    // Day tint
+    const phase = (room.state as any)?.dayPhase ?? 0.3;
+    const darkness = 0.5 * (1 - Math.cos(phase * Math.PI * 2)) * 0.25;
+    this.dayTint.setFillStyle(0x101830, darkness);
 
     this.drawMinimap();
     this.selfFootStepPhase += dt * (dx !== 0 || dy !== 0 ? (wantSprint ? 14 : 9) : 0);
   }
 
   // =======================================================================
-  // World render — bake tiles+buildings+props into a cached texture once,
-  // then show it as a single Image. No RenderTexture dependency.
+  // Self
   // =======================================================================
-  private drawWorldInto(worldPxW: number, worldPxH: number) {
-    const gfx = this.add.graphics({ x: 0, y: 0 });
-    gfx.setVisible(false);
+  private renderSelf(dx: number, dy: number, wantSprint: boolean, _dt: number, self: any) {
+    const x = Math.round(this.selfPredicted.x);
+    const y = Math.round(this.selfPredicted.y);
+    this.selfContainer.setPosition(x, y);
+    const moving = (dx !== 0 || dy !== 0);
+    const bob = moving ? Math.sin(this.selfFootStepPhase) * 1.2 : 0;
+    this.selfBody.y = bob;
+    this.selfHem.y = PLAYER_SIZE - 4 + bob;
 
-    // Base tiles.
-    for (let y = 0; y < MAP_H; y++) {
-      for (let x = 0; x < MAP_W; x++) {
-        const tile = this.map[y][x];
-        this.drawTile(gfx, x, y, tile);
-      }
+    const now = Date.now();
+    // Damage flash
+    if (self && now < self.hitFlashUntil) {
+      const t = (self.hitFlashUntil - now) / 220;
+      this.selfBody.fillColor = Phaser.Display.Color.Interpolate.ColorWithColor(
+        Phaser.Display.Color.HexStringToColor(self.color),
+        Phaser.Display.Color.HexStringToColor("#ff5a5a"),
+        1, t,
+      ).color as any as number;
+    } else if (self) {
+      this.selfBody.fillColor = Phaser.Display.Color.HexStringToColor(self.color).color;
     }
-
-    // Buildings (on top of base tiles).
-    for (const b of this.buildings) this.drawBuilding(gfx, b);
-
-    // Static prop details: well, stalls, lanterns, trees, stairs.
-    for (let y = 0; y < MAP_H; y++) {
-      for (let x = 0; x < MAP_W; x++) {
-        const tile = this.map[y][x];
-        if (tile === T.WELL)          this.drawWell(gfx, x, y);
-        else if (tile === T.MARKET_STALL) this.drawMarketStall(gfx, x, y);
-        else if (tile === T.LANTERN)  this.drawLantern(gfx, x, y);
-        else if (tile === T.TREE)     this.drawTree(gfx, x, y);
-        else if (tile === T.STAIRS)   this.drawStairs(gfx, x, y);
-      }
-    }
-
-    // Bake to a cached texture, then display it as a single Image.
-    // generateTexture: async-safe, universally supported across Phaser 3.x.
-    const key = "__tallinn_world";
-    if (this.textures.exists(key)) this.textures.remove(key);
-    gfx.generateTexture(key, worldPxW, worldPxH);
-    gfx.destroy();
-    this.add.image(0, 0, key).setOrigin(0, 0).setDepth(0);
-
-    // Building labels (drawn as text objects, not baked into RT).
-    for (const b of this.buildings) {
-      if (!b.showLabel) continue;
-      const cx = (b.x + b.w / 2) * TILE_SIZE;
-      const cy = (b.y + b.h / 2) * TILE_SIZE;
-      this.add.text(cx, cy + b.h * TILE_SIZE / 2 + 8, b.name, {
-        fontFamily: "serif", fontSize: "14px", color: "#f4d58d",
-        stroke: "#1a1108", strokeThickness: 3,
-      }).setOrigin(0.5).setAlpha(0.95).setDepth(50);
-    }
-
-    // Decorative area labels for famous streets/squares.
-    const areaLabels: Array<{ x: number; y: number; text: string; size?: number }> = [
-      { x: 28, y: 19, text: "Raekoja plats", size: 18 },
-      { x: 8, y: 8, text: "Toompea", size: 16 },
-      { x: 25, y: 1, text: "Viru värav", size: 12 },
-      { x: 15, y: 38, text: "Harju värav", size: 12 },
-      { x: 17, y: 13, text: "Pikk jalg", size: 11 },
-      { x: 15, y: 12, text: "Lühike jalg", size: 10 },
-    ];
-    for (const l of areaLabels) {
-      this.add.text(l.x * TILE_SIZE, l.y * TILE_SIZE, l.text, {
-        fontFamily: "serif", fontSize: `${l.size || 13}px`, color: "#f4d58d",
-        stroke: "#1a1108", strokeThickness: 3,
-      }).setOrigin(0.5).setAlpha(0.75).setDepth(48);
-    }
-  }
-
-  private drawTile(g: Phaser.GameObjects.Graphics, x: number, y: number, tile: number) {
-    const px = x * TILE_SIZE, py = y * TILE_SIZE;
-    const base = TILE_BASE_COLORS[tile] ?? 0x000000;
-    g.fillStyle(base, 1);
-    g.fillRect(px, py, TILE_SIZE, TILE_SIZE);
-
-    switch (tile) {
-      case T.STREET: {
-        // Rough cobblestone: multiple small stones with slight variation.
-        const seed = (x * 73856093) ^ (y * 19349663);
-        g.fillStyle(0x4d4335, 1);
-        for (let i = 0; i < 5; i++) {
-          const rx = ((seed >>> (i * 3)) & 31);
-          const ry = ((seed >>> (i * 5 + 3)) & 31);
-          g.fillRect(px + rx, py + ry, 3, 3);
-        }
-        g.fillStyle(0x7a6a54, 0.8);
-        g.fillRect(px + 4, py + 6, 4, 3);
-        g.fillRect(px + 18, py + 20, 5, 3);
-        break;
-      }
-      case T.PLAZA: {
-        // Polished cobblestone — herringbone-ish pattern.
-        const seed = (x * 73856093) ^ (y * 19349663);
-        g.fillStyle(0x776553, 1);
-        for (let i = 0; i < 4; i++) {
-          const rx = 2 + ((seed >>> (i * 4)) & 27);
-          const ry = 2 + ((seed >>> (i * 5 + 2)) & 27);
-          g.fillRect(px + rx, py + ry, 4, 2);
-        }
-        g.fillStyle(0x9d8e72, 0.9);
-        g.fillRect(px + 10, py + 4, 6, 2);
-        g.fillRect(px + 2, py + 20, 5, 2);
-        g.fillRect(px + 22, py + 14, 5, 2);
-        // subtle highlight line
-        g.lineStyle(1, 0xc0a87d, 0.18);
-        g.beginPath(); g.moveTo(px, py + 16); g.lineTo(px + TILE_SIZE, py + 16); g.strokePath();
-        break;
-      }
-      case T.TOOMPEA_GROUND: {
-        // Warmer, bigger stones.
-        g.fillStyle(0x6d5a45, 1);
-        g.fillRect(px + 3, py + 3, 8, 8);
-        g.fillRect(px + 16, py + 6, 10, 8);
-        g.fillRect(px + 6, py + 18, 10, 10);
-        g.fillStyle(0xa28566, 0.6);
-        g.fillRect(px + 8, py + 5, 3, 2);
-        g.fillRect(px + 20, py + 10, 3, 2);
-        break;
-      }
-      case T.GRASS: {
-        g.fillStyle(0x546b35, 1);
-        g.fillRect(px + 4, py + 10, 3, 2);
-        g.fillRect(px + 18, py + 20, 3, 2);
-        g.fillRect(px + 12, py + 4, 3, 2);
-        break;
-      }
-      case T.WALL: {
-        // Medieval stonework with crenellations on the outermost row.
-        g.fillStyle(0x554638, 1);
-        g.fillRect(px + 1, py + 1, TILE_SIZE - 2, TILE_SIZE - 2);
-        g.fillStyle(0x35281e, 1);
-        for (let ly = 0; ly < TILE_SIZE; ly += 8) g.fillRect(px, py + ly, TILE_SIZE, 1);
-        for (let lx = 0; lx < TILE_SIZE; lx += 10) g.fillRect(px + lx, py, 1, TILE_SIZE);
-        // Highlight
-        g.fillStyle(0x7a6850, 0.35);
-        g.fillRect(px + 2, py + 2, TILE_SIZE - 4, 2);
-        // Crenellation on outer rows
-        if (y === 0 || x === 0 || y === MAP_H - 1 || x === MAP_W - 1) {
-          g.fillStyle(0x1f1a14, 1);
-          for (let cx = 0; cx < TILE_SIZE; cx += 8) g.fillRect(px + cx, py, 4, 4);
-        }
-        break;
-      }
-      case T.CASTLE_WALL: {
-        g.fillStyle(0x3f3227, 1);
-        g.fillRect(px + 1, py + 1, TILE_SIZE - 2, TILE_SIZE - 2);
-        g.fillStyle(0x26190f, 1);
-        g.fillRect(px + 6, py + 4, 4, 5);
-        g.fillRect(px + 20, py + 10, 4, 5);
-        g.fillRect(px + 12, py + 20, 4, 5);
-        g.fillStyle(0x5d4a38, 0.35);
-        g.fillRect(px + 2, py + 2, TILE_SIZE - 4, 2);
-        break;
-      }
-      case T.GATE: {
-        g.fillStyle(0x5a4232, 1);
-        g.fillRect(px + 3, py + 3, TILE_SIZE - 6, TILE_SIZE - 6);
-        g.fillStyle(0x1e140c, 1);
-        g.fillRect(px + 10, py + 10, TILE_SIZE - 20, TILE_SIZE - 12);
-        g.lineStyle(1, 0x7c6449, 1);
-        g.strokeRect(px + 10, py + 10, TILE_SIZE - 20, TILE_SIZE - 12);
-        break;
-      }
-      case T.WATER: {
-        g.fillStyle(0x294863, 1);
-        g.fillRect(px, py, TILE_SIZE, TILE_SIZE);
-        g.fillStyle(0x3a6389, 0.9);
-        g.fillRect(px + 2, py + 10, TILE_SIZE - 4, 3);
-        g.fillStyle(0x4a7a9a, 0.7);
-        g.fillRect(px + 4, py + 20, TILE_SIZE - 10, 2);
-        break;
-      }
-      default: break;
-    }
-  }
-
-  // -------------------- buildings --------------------
-  private drawBuilding(g: Phaser.GameObjects.Graphics, b: Building) {
-    const px = b.x * TILE_SIZE, py = b.y * TILE_SIZE;
-    const w = b.w * TILE_SIZE, h = b.h * TILE_SIZE;
-
-    switch (b.style) {
-      case "merchant":     return this.drawMerchantHouse(g, b, px, py, w, h);
-      case "townhall":     return this.drawTownHall(g, b, px, py, w, h);
-      case "oleviste":     return this.drawOleviste(g, b, px, py, w, h);
-      case "pikkhermann":  return this.drawPikkHermann(g, b, px, py, w, h);
-      case "domechurch":   return this.drawDomeChurch(g, b, px, py, w, h);
-      default:             return;
-    }
-  }
-
-  private drawMerchantHouse(g: Phaser.GameObjects.Graphics, b: Building, px: number, py: number, w: number, h: number) {
-    const facade = Phaser.Display.Color.HexStringToColor(b.facade || "#d8a785").color;
-    const roof = Phaser.Display.Color.HexStringToColor(b.roof || "#8e3b26").color;
-    const accent = Phaser.Display.Color.HexStringToColor(b.accent || "#5a2f20").color;
-
-    // body
-    g.fillStyle(facade, 1);
-    g.fillRect(px + 2, py + 6, w - 4, h - 8);
-    // vertical facade seams
-    g.fillStyle(accent, 0.25);
-    for (let sx = 8; sx < w - 4; sx += 10) g.fillRect(px + sx, py + 6, 1, h - 8);
-
-    // windows — diamond panes rows
-    const winCols = Math.max(2, Math.floor((w - 6) / 10));
-    const winRowsN = Math.max(1, Math.floor((h - 14) / 10));
-    for (let r = 0; r < winRowsN; r++) {
-      for (let c = 0; c < winCols; c++) {
-        const wx = px + 6 + c * ((w - 8) / winCols);
-        const wy = py + 10 + r * 10;
-        g.fillStyle(0xd9b26a, 0.85);
-        g.fillRect(wx, wy, 6, 5);
-        g.fillStyle(accent, 0.8);
-        g.fillRect(wx + 2, wy, 2, 5);
-        g.fillRect(wx, wy + 2, 6, 1);
-      }
-    }
-
-    // door on ground-floor center
-    g.fillStyle(accent, 1);
-    g.fillRect(px + w / 2 - 3, py + h - 10, 6, 8);
-    g.fillStyle(0xe7c258, 0.9);
-    g.fillRect(px + w / 2 - 1, py + h - 6, 1, 1); // door handle
-
-    // roof + gable
-    if (b.gable === "stepped") {
-      // stepped Gothic gable: rising steps from corners to peak
-      const steps = Math.min(4, Math.max(2, Math.floor(w / 12)));
-      const stepW = Math.floor((w - 6) / (steps * 2 + 1));
-      g.fillStyle(roof, 1);
-      g.fillRect(px + 2, py + 2, w - 4, 5);
-      for (let i = 0; i < steps; i++) {
-        const leftX = px + 2 + stepW * (i + 1);
-        const rightX = px + w - 2 - stepW * (i + 1) - stepW;
-        const h2 = 4 + i * 3;
-        g.fillRect(leftX, py - h2, stepW, h2 + 4);
-        g.fillRect(rightX, py - h2, stepW, h2 + 4);
-      }
-      // peak
-      g.fillRect(px + w / 2 - stepW / 2, py - (4 + steps * 3) - 2, stepW, 6);
+    // Dead? Make self greyscale-ish
+    if (self?.deadUntil) {
+      this.selfBody.setAlpha(0.4);
     } else {
-      // triangle gable
-      g.fillStyle(roof, 1);
-      g.fillRect(px + 2, py + 2, w - 4, 5);
-      g.fillTriangle(px + 2, py + 2, px + w - 2, py + 2, px + w / 2, py - 8);
+      this.selfBody.setAlpha(1);
     }
 
-    // subtle dark baseline
-    g.fillStyle(0x1b0f09, 0.3);
-    g.fillRect(px + 2, py + h - 3, w - 4, 2);
-  }
+    this.selfLabel.setPosition(x + PLAYER_SIZE / 2, y - 2);
+    this.selfLabel.setText(self ? self.name : "");
 
-  private drawTownHall(g: Phaser.GameObjects.Graphics, b: Building, px: number, py: number, w: number, h: number) {
-    const facade = Phaser.Display.Color.HexStringToColor(b.facade || "#d8cfae").color;
-    const roof = Phaser.Display.Color.HexStringToColor(b.roof || "#8e3b26").color;
-    const accent = Phaser.Display.Color.HexStringToColor(b.accent || "#5a4a30").color;
-
-    // Main body
-    g.fillStyle(facade, 1);
-    g.fillRect(px + 2, py + 16, w - 4, h - 18);
-
-    // Gothic arcaded base (pointed arches)
-    const archCount = 6;
-    const archW = (w - 8) / archCount;
-    for (let i = 0; i < archCount; i++) {
-      const ax = px + 4 + i * archW;
-      g.fillStyle(accent, 0.9);
-      g.fillRect(ax + 1, py + h - 18, archW - 2, 16);
-      g.fillStyle(0x1b130b, 1);
-      g.fillRect(ax + 3, py + h - 15, archW - 6, 10);
-      // pointed arch shape hint
-      g.fillStyle(accent, 1);
-      g.fillTriangle(ax + 3, py + h - 15, ax + archW - 3, py + h - 15, ax + archW / 2, py + h - 20);
+    // Swing arc
+    this.selfSwingGfx.clear();
+    if (self && now < self.attackEnd) {
+      const cx = x + PLAYER_SIZE / 2, cy = y + PLAYER_SIZE / 2;
+      const wpn = self.equipped?.get?.("weapon");
+      const range = (wpn?.bonusRange ?? 30) + 8;
+      const ang = self.aimAngle;
+      const t = 1 - (self.attackEnd - now) / 160;
+      this.selfSwingGfx.fillStyle(0xf4d58d, 0.28);
+      this.selfSwingGfx.slice(cx, cy, range, ang - 0.9, ang + 0.9, false);
+      this.selfSwingGfx.fillPath();
+      // Bright leading edge
+      this.selfSwingGfx.lineStyle(2, 0xfff2b3, 0.85 * (1 - t));
+      this.selfSwingGfx.beginPath();
+      this.selfSwingGfx.arc(cx, cy, range, ang - 0.9 + 1.8 * t, ang - 0.9 + 1.8 * t + 0.05, false);
+      this.selfSwingGfx.strokePath();
     }
-
-    // Two rows of tall narrow windows on the body
-    for (let r = 0; r < 2; r++) {
-      for (let i = 0; i < 8; i++) {
-        const wx = px + 5 + i * ((w - 10) / 8);
-        const wy = py + 20 + r * 14;
-        g.fillStyle(0xd9b26a, 0.9);
-        g.fillRect(wx, wy, 4, 10);
-        g.fillStyle(accent, 0.9);
-        g.fillRect(wx + 2, wy, 1, 10);
-        g.fillRect(wx, wy + 4, 4, 1);
-      }
-    }
-
-    // Stepped gable on main roof
-    g.fillStyle(roof, 1);
-    g.fillRect(px + 2, py + 12, w - 4, 6);
-    const steps = 5;
-    const stepW = Math.floor((w - 4) / (steps * 2 + 1));
-    for (let i = 0; i < steps; i++) {
-      const leftX = px + 2 + stepW * (i + 1);
-      const rightX = px + w - 2 - stepW * (i + 1) - stepW;
-      const hUp = 4 + i * 4;
-      g.fillRect(leftX, py + 12 - hUp, stepW, hUp + 4);
-      g.fillRect(rightX, py + 12 - hUp, stepW, hUp + 4);
-    }
-
-    // -------- Tall Gothic tower on the left (iconic) --------
-    const towerX = px + w * 0.18;
-    const towerW = Math.max(22, Math.floor(w * 0.17));
-    const spireH = b.spire || 140;
-    const towerTopY = py - spireH;
-    // tower shaft
-    g.fillStyle(facade, 1);
-    g.fillRect(towerX - towerW / 2, towerTopY + 34, towerW, spireH - 34);
-    g.fillStyle(accent, 0.3);
-    g.fillRect(towerX - towerW / 2, towerTopY + 34, 2, spireH - 34);
-    g.fillRect(towerX + towerW / 2 - 2, towerTopY + 34, 2, spireH - 34);
-
-    // clock face
-    g.fillStyle(0xe7c258, 1);
-    g.fillCircle(towerX, towerTopY + 80, 7);
-    g.fillStyle(0x1b130b, 1);
-    g.fillCircle(towerX, towerTopY + 80, 5);
-    g.lineStyle(1, 0xe7c258, 1);
-    g.beginPath(); g.moveTo(towerX, towerTopY + 80); g.lineTo(towerX + 3, towerTopY + 78); g.strokePath();
-    g.beginPath(); g.moveTo(towerX, towerTopY + 80); g.lineTo(towerX, towerTopY + 76); g.strokePath();
-
-    // tower windows
-    for (let i = 0; i < 3; i++) {
-      g.fillStyle(0x1b130b, 1);
-      g.fillRect(towerX - 2, towerTopY + 40 + i * 20, 4, 6);
-    }
-
-    // Octagonal base platform
-    g.fillStyle(0x8a7050, 1);
-    g.fillRect(towerX - towerW / 2 - 2, towerTopY + 30, towerW + 4, 6);
-
-    // Tall green copper spire (slim)
-    g.fillStyle(0x3a6b5a, 1);
-    g.fillTriangle(
-      towerX - towerW / 2 + 2, towerTopY + 34,
-      towerX + towerW / 2 - 2, towerTopY + 34,
-      towerX, towerTopY - 6,
-    );
-    // Spire highlight
-    g.fillStyle(0x5a8e77, 0.7);
-    g.fillTriangle(
-      towerX - towerW / 2 + 4, towerTopY + 34,
-      towerX, towerTopY + 34,
-      towerX - 1, towerTopY - 2,
-    );
-    // Weathervane (Vana Toomas): flag pole + silhouette
-    g.fillStyle(0x2a1408, 1);
-    g.fillRect(towerX - 1, towerTopY - 20, 2, 18);
-    g.fillStyle(0xd9a74a, 1);
-    // simple knight figure silhouette
-    g.fillRect(towerX - 5, towerTopY - 26, 10, 3);   // banner
-    g.fillRect(towerX - 2, towerTopY - 30, 3, 5);    // body
-    g.fillRect(towerX - 3, towerTopY - 32, 5, 3);    // hat
-
-    // Base shadow
-    g.fillStyle(0x0f0907, 0.4);
-    g.fillRect(px + 2, py + h - 3, w - 4, 2);
-  }
-
-  private drawOleviste(g: Phaser.GameObjects.Graphics, b: Building, px: number, py: number, w: number, h: number) {
-    const facade = Phaser.Display.Color.HexStringToColor(b.facade || "#9b8a78").color;
-    const roof = Phaser.Display.Color.HexStringToColor(b.roof || "#3a2418").color;
-
-    // base hall
-    g.fillStyle(facade, 1);
-    g.fillRect(px + 2, py + 24, w - 4, h - 26);
-    // pointed arch windows
-    for (let i = 0; i < 3; i++) {
-      const wx = px + 4 + i * ((w - 8) / 3);
-      g.fillStyle(0x1b130b, 1);
-      g.fillRect(wx, py + 30, 4, 14);
-      g.fillTriangle(wx, py + 30, wx + 4, py + 30, wx + 2, py + 26);
-    }
-    // massive central tower
-    const centerX = px + w / 2;
-    const towerW = Math.max(24, w * 0.4);
-    const spireH = b.spire || 200;
-    const baseTop = py + 18;
-    // tower body
-    g.fillStyle(facade, 1);
-    g.fillRect(centerX - towerW / 2, baseTop - spireH + 40, towerW, spireH + 10);
-    // tower bands
-    g.fillStyle(0x6a5a48, 1);
-    for (let i = 0; i < 6; i++) g.fillRect(centerX - towerW / 2, baseTop - spireH + 60 + i * 22, towerW, 2);
-    // arched windows on tower
-    for (let i = 0; i < 4; i++) {
-      g.fillStyle(0x1b130b, 1);
-      g.fillRect(centerX - 3, baseTop - spireH + 70 + i * 30, 6, 10);
-    }
-    // tall pointy spire (the tallest building in world once)
-    g.fillStyle(roof, 1);
-    g.fillTriangle(
-      centerX - towerW / 2 + 2, baseTop - spireH + 40,
-      centerX + towerW / 2 - 2, baseTop - spireH + 40,
-      centerX, baseTop - spireH - 30,
-    );
-    // spire highlight
-    g.fillStyle(0x5a3a28, 0.7);
-    g.fillTriangle(
-      centerX - towerW / 2 + 4, baseTop - spireH + 40,
-      centerX, baseTop - spireH + 40,
-      centerX - 2, baseTop - spireH - 20,
-    );
-    // cross on top
-    g.fillStyle(0xd9a74a, 1);
-    g.fillRect(centerX - 1, baseTop - spireH - 40, 2, 14);
-    g.fillRect(centerX - 5, baseTop - spireH - 32, 10, 2);
-
-    // small side roof
-    g.fillStyle(roof, 1);
-    g.fillRect(px + 2, py + 20, w - 4, 4);
-    g.fillTriangle(px + 2, py + 20, px + w - 2, py + 20, px + w / 2, py + 14);
-
-    g.fillStyle(0x0f0907, 0.4);
-    g.fillRect(px + 2, py + h - 3, w - 4, 2);
-  }
-
-  private drawPikkHermann(g: Phaser.GameObjects.Graphics, b: Building, px: number, py: number, w: number, h: number) {
-    const facade = Phaser.Display.Color.HexStringToColor(b.facade || "#6a6058").color;
-    const spireH = b.spire || 80;
-    const centerX = px + w / 2;
-    const baseW = w - 6;
-
-    // round-ish tower body (approximate round with stacked rectangles)
-    g.fillStyle(facade, 1);
-    g.fillRect(px + 3, py + 6, baseW, h - 8);
-    g.fillRect(centerX - baseW / 2 - 2, py + 10, baseW + 4, h - 14); // slight bulge
-    // stone bands
-    g.fillStyle(0x3e3730, 1);
-    for (let i = 0; i < 6; i++) g.fillRect(px + 3, py + 8 + i * 10, baseW, 1);
-    // arrow slits
-    for (let i = 0; i < 4; i++) {
-      g.fillStyle(0x15110d, 1);
-      g.fillRect(centerX - 1, py + 14 + i * 14, 2, 8);
-    }
-
-    // tall tower extension upward
-    g.fillStyle(facade, 1);
-    g.fillRect(centerX - 8, py + 6 - spireH, 16, spireH + 6);
-    // battlements
-    g.fillStyle(0x25201a, 1);
-    for (let cx = -8; cx < 10; cx += 4) g.fillRect(centerX + cx, py + 6 - spireH - 4, 2, 6);
-
-    // Flagpole + Estonian flag (blue-black-white)
-    g.fillStyle(0x1b130b, 1);
-    g.fillRect(centerX - 1, py - spireH - 14, 2, 10);
-    g.fillStyle(0x0f4da2, 1);   // blue
-    g.fillRect(centerX + 1, py - spireH - 14, 14, 3);
-    g.fillStyle(0x111111, 1);   // black
-    g.fillRect(centerX + 1, py - spireH - 11, 14, 3);
-    g.fillStyle(0xf0efe8, 1);   // white
-    g.fillRect(centerX + 1, py - spireH - 8, 14, 3);
-  }
-
-  private drawDomeChurch(g: Phaser.GameObjects.Graphics, b: Building, px: number, py: number, w: number, h: number) {
-    const facade = Phaser.Display.Color.HexStringToColor(b.facade || "#e4dcc9").color;
-    const roof = Phaser.Display.Color.HexStringToColor(b.roof || "#7a3321").color;
-
-    g.fillStyle(facade, 1);
-    g.fillRect(px + 2, py + 10, w - 4, h - 12);
-    // white-wash highlight
-    g.fillStyle(0xffffff, 0.15);
-    g.fillRect(px + 2, py + 12, w - 4, 2);
-
-    // Stepped roof
-    g.fillStyle(roof, 1);
-    g.fillRect(px + 2, py + 6, w - 4, 6);
-    g.fillTriangle(px + 2, py + 6, px + w - 2, py + 6, px + w / 2, py - 6);
-
-    // Small squat tower in center with baroque dome
-    const centerX = px + w / 2;
-    g.fillStyle(facade, 1);
-    g.fillRect(centerX - 8, py - 26, 16, 30);
-    g.fillStyle(0x7a3321, 1);
-    // onion dome-ish
-    g.fillEllipse(centerX, py - 32, 20, 16);
-    g.fillStyle(0xd9a74a, 1);
-    g.fillRect(centerX - 1, py - 46, 2, 12);
-    // cross
-    g.fillStyle(0xd9a74a, 1);
-    g.fillRect(centerX - 1, py - 54, 2, 8);
-    g.fillRect(centerX - 4, py - 50, 8, 2);
-
-    // arched windows
-    for (let i = 0; i < 3; i++) {
-      const wx = px + 4 + i * ((w - 8) / 3);
-      g.fillStyle(0x1b130b, 1);
-      g.fillRect(wx, py + 14, 5, 10);
-      g.fillTriangle(wx, py + 14, wx + 5, py + 14, wx + 2, py + 10);
-    }
-  }
-
-  // -------------------- tile decorations --------------------
-  private drawWell(g: Phaser.GameObjects.Graphics, x: number, y: number) {
-    const cx = x * TILE_SIZE + TILE_SIZE / 2;
-    const cy = y * TILE_SIZE + TILE_SIZE / 2;
-    g.fillStyle(0x4a4138, 1);
-    g.fillCircle(cx, cy, 11);
-    g.fillStyle(0x1a1510, 1);
-    g.fillCircle(cx, cy, 7);
-    g.fillStyle(0x5a4b3b, 1);
-    g.fillRect(cx - 2, cy - 16, 4, 10);  // upright
-    g.fillRect(cx - 10, cy - 16, 20, 3); // cross beam
-    g.fillStyle(0x2a1a10, 1);
-    g.fillRect(cx - 2, cy - 10, 4, 6);  // bucket
-  }
-
-  private drawMarketStall(g: Phaser.GameObjects.Graphics, x: number, y: number) {
-    const px = x * TILE_SIZE, py = y * TILE_SIZE;
-    const tarp = [0xa3786a, 0xb8914a, 0x6b8a6a, 0x7b6a9a][(x + y) % 4];
-    g.fillStyle(0x3e2a1c, 1);
-    g.fillRect(px + 4, py + 10, TILE_SIZE - 8, 8);  // table
-    g.fillStyle(tarp, 1);
-    g.fillRect(px + 2, py + 4, TILE_SIZE - 4, 8);    // canopy
-    g.fillStyle(0x1a1108, 0.5);
-    for (let i = 0; i < 5; i++) g.fillRect(px + 4 + i * 5, py + 12, 2, 2); // goods
-  }
-
-  private drawLantern(g: Phaser.GameObjects.Graphics, x: number, y: number) {
-    const cx = x * TILE_SIZE + TILE_SIZE / 2;
-    const py = y * TILE_SIZE;
-    g.fillStyle(0x2a1a10, 1);
-    g.fillRect(cx - 1, py + 10, 2, 18);
-    g.fillStyle(0xe7c258, 1);
-    g.fillRect(cx - 4, py + 6, 8, 6);
-    g.fillStyle(0x2a1a10, 1);
-    g.fillRect(cx - 1, py + 4, 2, 3);
-  }
-
-  private drawTree(g: Phaser.GameObjects.Graphics, x: number, y: number) {
-    const cx = x * TILE_SIZE + TILE_SIZE / 2;
-    const cy = y * TILE_SIZE + TILE_SIZE / 2;
-    g.fillStyle(0x1f3b1a, 1);
-    g.fillCircle(cx, cy, 12);
-    g.fillStyle(0x2f5a24, 1);
-    g.fillCircle(cx - 3, cy - 3, 8);
-    g.fillStyle(0x2a1a10, 1);
-    g.fillRect(cx - 2, cy + 8, 4, 6);
-  }
-
-  private drawStairs(g: Phaser.GameObjects.Graphics, x: number, y: number) {
-    const px = x * TILE_SIZE, py = y * TILE_SIZE;
-    g.fillStyle(0x7e6a50, 1);
-    g.fillRect(px, py, TILE_SIZE, TILE_SIZE);
-    g.fillStyle(0x4a3a28, 1);
-    for (let i = 0; i < 4; i++) g.fillRect(px + 2, py + 4 + i * 7, TILE_SIZE - 4, 2);
-    g.fillStyle(0xaa9070, 0.5);
-    g.fillRect(px + 2, py + 2, TILE_SIZE - 4, 1);
   }
 
   // =======================================================================
-  // NPC visuals
-  // =======================================================================
-  private spawnNpc(npc: any, id: string) {
-    const style = NPC_STYLE[npc.role] || { body: 0x7b6a58, hat: 0x3a2a20 };
-    const c = this.add.container(npc.x - 10, npc.y - 10).setDepth(95);
-
-    // shadow
-    const shadow = this.add.ellipse(10, 22, 22, 6, 0x000000, 0.4);
-    // body
-    const body = this.add.rectangle(2, 2, 16, 22, style.body).setOrigin(0, 0).setStrokeStyle(1, 0x1a1108);
-    // head
-    const head = this.add.rectangle(4, -6, 12, 10, 0xf0c89a).setOrigin(0, 0).setStrokeStyle(1, 0x1a1108);
-    // hat
-    const hat = this.add.rectangle(3, -10, 14, 5, style.hat).setOrigin(0, 0);
-    // eyes
-    const e1 = this.add.rectangle(7, -2, 2, 2, 0x111).setOrigin(0, 0);
-    const e2 = this.add.rectangle(12, -2, 2, 2, 0x111).setOrigin(0, 0);
-
-    c.add([shadow, body, head, hat, e1, e2]);
-
-    // Attention ring (visible when this NPC has an active order)
-    const ring = this.add.circle(10, 2, 18, 0xe9c46a, 0).setStrokeStyle(2, 0xe9c46a, 0.8).setVisible(false);
-    const bang = this.add.text(10, -26, "!", {
-      fontFamily: "Georgia,serif", fontSize: "22px", color: "#ffd166",
-      stroke: "#1a1108", strokeThickness: 3, fontStyle: "bold",
-    }).setOrigin(0.5).setVisible(false);
-    c.add([ring, bang]);
-
-    // Nametag below
-    const nameTag = this.add.text(npc.x, npc.y + 18, npc.shortName, {
-      fontFamily: "monospace", fontSize: "10px", color: "#f4d58d",
-      stroke: "#1a1108", strokeThickness: 3,
-    }).setOrigin(0.5, 0).setDepth(96).setAlpha(0.85);
-
-    this.npcVisuals.set(id, { container: c, ring, bang, nameTag, role: npc.role });
-  }
-
-  // =======================================================================
-  // Remote players
+  // Remotes
   // =======================================================================
   private addRemote(sid: string, player: any) {
-    const c = this.add.container(player.x, player.y);
+    const c = this.add.container(player.x, player.y).setDepth(100);
     const shadow = this.add.ellipse(PLAYER_SIZE / 2, PLAYER_SIZE - 1, PLAYER_SIZE * 0.9, 6, 0x000000, 0.45);
     const body = this.add.rectangle(0, 0, PLAYER_SIZE, PLAYER_SIZE,
       Phaser.Display.Color.HexStringToColor(player.color).color).setStrokeStyle(1, 0x1a1108, 1).setOrigin(0, 0);
-    const e1 = this.add.rectangle(6, 7, 3, 3, 0x1a1108).setOrigin(0, 0);
-    const e2 = this.add.rectangle(13, 7, 3, 3, 0x1a1108).setOrigin(0, 0);
     const hem = this.add.rectangle(0, PLAYER_SIZE - 4, PLAYER_SIZE, 4, 0x000000, 0.4).setOrigin(0, 0);
-    const pack = this.add.rectangle(PLAYER_SIZE / 2, -4, 12, 10, 0xd8c58a)
-      .setStrokeStyle(1, 0x5a3a22).setOrigin(0.5, 0).setVisible(!!player.carryingOrderId);
-    c.add([shadow, body, e1, e2, hem, pack]);
-    c.setDepth(100);
+    c.add([shadow, body, hem]);
     const label = this.add.text(player.x + PLAYER_SIZE / 2, player.y - 2, player.name, {
       fontFamily: "monospace", fontSize: "11px", color: "#fff",
       stroke: "#000", strokeThickness: 3,
     }).setOrigin(0.5, 1).setDepth(199);
+    const hpBar = this.add.graphics().setDepth(198);
+    const swingGfx = this.add.graphics().setDepth(104);
     this.remotes.set(sid, {
-      container: c, body, pack, label,
-      buffer: [{ t: performance.now(), x: player.x, y: player.y, facing: player.facing, sprinting: !!player.sprinting, carrying: !!player.carryingOrderId }],
+      container: c, body, label, hpBar, swingGfx,
+      buffer: [{ t: performance.now(), x: player.x, y: player.y, facing: player.facing, hp: player.hp, hpMax: player.hpMax, aim: player.aimAngle, attackEnd: player.attackEnd, deadUntil: player.deadUntil }],
       color: player.color, name: player.name,
     });
   }
 
-  // =======================================================================
-  // Rendering self + remotes
-  // =======================================================================
-  private renderSelf(dx: number, dy: number, wantSprint: boolean, dt: number) {
-    const x = Math.round(this.selfPredicted.x);
-    const y = Math.round(this.selfPredicted.y);
-    this.selfContainer.setPosition(x, y);
-    this.selfLabel.setPosition(x + PLAYER_SIZE / 2, y - 2);
-
-    // Foot bob: vertical squash during walk.
-    const moving = (dx !== 0 || dy !== 0);
-    const bob = moving ? Math.sin(this.selfFootStepPhase) * 1.2 : 0;
-    this.selfBody.y = bob;
-    this.selfEye1.y = 7 + bob;
-    this.selfEye2.y = 7 + bob;
-    this.selfHem.y = PLAYER_SIZE - 4 + bob;
-    this.selfPackage.y = -4 + bob;
-
-    // Eye direction — shift eyes a hair in facing direction.
-    // Infer facing from input (we don't wait for server).
-    let facing = 0;
-    if (Math.abs(dx) > Math.abs(dy)) facing = dx > 0 ? 3 : dx < 0 ? 2 : 0;
-    else if (dy !== 0) facing = dy > 0 ? 0 : 1;
-    const ox = facing === 3 ? 1 : facing === 2 ? -1 : 0;
-    const oy = facing === 0 ? 1 : facing === 1 ? -1 : 0;
-    this.selfEye1.x = 6 + ox; this.selfEye1.y = 7 + oy + bob;
-    this.selfEye2.x = 13 + ox; this.selfEye2.y = 7 + oy + bob;
-
-    // Sprint speed lines.
-    const sprinting = wantSprint && this.selfStamina > 0.02 && moving;
-    this.selfSprintFx.setVisible(sprinting);
-    if (sprinting) {
-      this.selfSprintFx.fillAlpha = 0.25 + 0.25 * Math.sin(this.selfFootStepPhase * 1.6);
-    }
-  }
-
   private renderRemotes() {
-    const renderT = performance.now() - 100;
+    const now = performance.now();
+    const renderT = now - 100;
     for (const [, r] of this.remotes) {
       const buf = r.buffer;
       if (buf.length === 0) continue;
@@ -1159,12 +634,232 @@ class GameScene extends Phaser.Scene {
       const ry = a.y + (b.y - a.y) * alpha;
       r.container.setPosition(Math.round(rx), Math.round(ry));
       r.label.setPosition(rx + PLAYER_SIZE / 2, ry - 2);
-      r.pack.setVisible(b.carrying);
+
+      // HP bar above head (only if damaged)
+      r.hpBar.clear();
+      const hpPct = b.hpMax > 0 ? b.hp / b.hpMax : 1;
+      if (hpPct < 1 && !b.deadUntil) {
+        r.hpBar.fillStyle(0x1a1108, 0.85);
+        r.hpBar.fillRect(rx - 4, ry - 10, PLAYER_SIZE + 8, 4);
+        r.hpBar.fillStyle(hpPct > 0.6 ? 0x2a9d8f : hpPct > 0.3 ? 0xf4a261 : 0xef476f, 1);
+        r.hpBar.fillRect(rx - 3, ry - 9, (PLAYER_SIZE + 6) * hpPct, 2);
+      }
+
+      // Swing arc
+      r.swingGfx.clear();
+      const serverNow = Date.now();
+      if (serverNow < b.attackEnd) {
+        const cx = rx + PLAYER_SIZE / 2, cy = ry + PLAYER_SIZE / 2;
+        const range = 46;
+        const ang = b.aim;
+        r.swingGfx.fillStyle(0xf4a261, 0.3);
+        r.swingGfx.slice(cx, cy, range, ang - 0.9, ang + 0.9, false);
+        r.swingGfx.fillPath();
+      }
+
+      // Dead fade
+      if (b.deadUntil) {
+        r.body.setAlpha(0.3);
+      } else {
+        r.body.setAlpha(1);
+      }
     }
   }
 
   // =======================================================================
-  // Collision (client prediction)
+  // Enemies
+  // =======================================================================
+  private spawnEnemyVisual(e: any, id: string) {
+    const style = ENEMY_STYLE[e.kind] || ENEMY_STYLE.revenant;
+    const size = style.size;
+    const c = this.add.container(e.x - size / 2, e.y - size / 2).setDepth(95);
+    const shadow = this.add.ellipse(size / 2, size + 1, size * 0.9, 5, 0x000000, 0.45);
+    const body = this.add.rectangle(0, 0, size, size, style.body).setOrigin(0, 0).setStrokeStyle(1, 0x1a1108);
+    const head = this.add.rectangle(size * 0.2, -6, size * 0.6, 8, 0xf0c89a).setOrigin(0, 0).setStrokeStyle(1, 0x1a1108);
+    const hat = this.add.rectangle(size * 0.15, -9, size * 0.7, 4, style.hat).setOrigin(0, 0);
+    c.add([shadow, body, head, hat]);
+    const label = this.add.text(e.x, e.y + 14, e.shortName || e.kind, {
+      fontFamily: "monospace", fontSize: "10px", color: e.kind === "merchant" ? "#f4d58d" : "#ffcfcf",
+      stroke: "#1a1108", strokeThickness: 3,
+    }).setOrigin(0.5, 0).setDepth(96).setAlpha(0.9);
+    const hpBar = this.add.graphics().setDepth(97);
+    this.enemies.set(id, {
+      kind: e.kind, container: c, body, label, hpBar,
+      x: e.x, y: e.y, hp: e.hp, hpMax: e.hpMax, hitFlashUntil: e.hitFlashUntil, deadFade: 0,
+    });
+  }
+
+  private renderEnemies() {
+    const now = performance.now();
+    const serverNow = Date.now();
+    for (const [, v] of this.enemies) {
+      const style = ENEMY_STYLE[v.kind] || ENEMY_STYLE.revenant;
+      v.hpBar.clear();
+      if (v.kind !== "merchant" && v.hpMax > 0) {
+        const pct = Math.max(0, v.hp / v.hpMax);
+        if (pct < 1 || serverNow < v.hitFlashUntil) {
+          v.hpBar.fillStyle(0x1a1108, 0.85);
+          v.hpBar.fillRect(v.x - style.size / 2 - 2, v.y - style.size / 2 - 8, style.size + 4, 3);
+          v.hpBar.fillStyle(pct > 0.5 ? 0xef476f : 0x9d2a2a, 1);
+          v.hpBar.fillRect(v.x - style.size / 2 - 1, v.y - style.size / 2 - 7, (style.size + 2) * pct, 1);
+        }
+      }
+      // Flash
+      if (serverNow < v.hitFlashUntil) {
+        v.body.fillColor = 0xffffff;
+      } else {
+        v.body.fillColor = style.body;
+      }
+      // Dead fade
+      if (v.deadFade > 0) {
+        const t = Math.min(1, (now - v.deadFade) / 2500);
+        v.container.setAlpha(1 - t);
+        v.label.setAlpha((1 - t) * 0.9);
+      }
+    }
+  }
+
+  // =======================================================================
+  // Loot bags
+  // =======================================================================
+  private spawnLootVisual(bag: any, id: string) {
+    const rarity: string = (bag.items?.at?.(0)?.rarity) || "common";
+    const color = RARITY_HEX[rarity] ?? 0xc7b99a;
+    const c = this.add.container(bag.x, bag.y).setDepth(60);
+    const pile = this.add.ellipse(0, 2, 14, 6, 0x2a1a0e, 0.85);
+    const glow = this.add.ellipse(0, 0, 22, 10, color, 0.22);
+    const body = this.add.rectangle(-5, -4, 10, 6, color).setStrokeStyle(1, 0x1a1108);
+    const strap = this.add.rectangle(-5, -2, 10, 2, 0x3a2a22);
+    c.add([glow, pile, body, strap]);
+    this.tweens.add({ targets: glow, scale: 1.15, yoyo: true, repeat: -1, duration: 900, ease: "Sine.easeInOut" });
+    let label: Phaser.GameObjects.Text | null = null;
+    const first = bag.items?.at?.(0);
+    if (first) {
+      label = this.add.text(bag.x, bag.y - 14, first.name, {
+        fontFamily: "monospace", fontSize: "10px",
+        color: RARITY_COLORS[first.rarity] || "#c7b99a",
+        stroke: "#1a1108", strokeThickness: 3,
+      }).setOrigin(0.5, 1).setDepth(61).setAlpha(0.9);
+    }
+    this.lootBags.set(id, { container: c, label });
+  }
+
+  // =======================================================================
+  // HUD
+  // =======================================================================
+  private renderHud(self: any) {
+    if (!self) return;
+    hpBar.style.width = `${Math.max(0, Math.min(100, (self.hp / self.hpMax) * 100))}%`;
+    hpText.textContent = `${Math.round(self.hp)} / ${self.hpMax}`;
+    if (self.hp / self.hpMax < 0.3) hpBar.classList.add("low"); else hpBar.classList.remove("low");
+
+    stamBarEl.style.width = `${Math.max(0, Math.min(100, self.stamina * 100))}%`;
+    if (self.stamina < 0.15) stamBarEl.classList.add("low"); else stamBarEl.classList.remove("low");
+
+    const inSafe = this.isSelfSafe();
+    const phase = self.deadUntil ? "DEAD" : (self.inRun ? "IN THE WILDS" : inSafe ? "SAFE HUB" : "LEAVING HUB");
+    const phaseColor = self.deadUntil ? "#ef476f" : (self.inRun ? "#f4a261" : "#2a9d8f");
+    scoreCard.innerHTML = `
+      <div class="score-num">${self.gold || 0}<span class="unit">gold</span></div>
+      <div class="score-rank" style="color:${phaseColor}">${phase}</div>
+      <div class="score-sub">kills: ${self.killsThisRun || 0} · extracts: ${self.extractions || 0}${self.pack?.length ? ` · pack: ${self.pack.length}/8` : ""}</div>
+    `;
+
+    const state: any = room?.state;
+    const rows: Array<{ name: string; gold: number; kills: number; mine: boolean }> = [];
+    if (state?.players?.forEach) {
+      state.players.forEach((p: any, sid: string) => {
+        rows.push({ name: p.name || sid.slice(0, 4), gold: p.gold || 0, kills: p.killsThisRun || 0, mine: sid === selfId });
+      });
+    }
+    rows.sort((a, b) => (b.gold * 1000 + b.kills) - (a.gold * 1000 + a.kills));
+    leaderboard.innerHTML = `
+      <div class="lb-head">Adventurers</div>
+      ${rows.slice(0, 6).map((r, i) => `
+        <div class="lb-row ${r.mine ? "me" : ""}">
+          <span class="rank">${i + 1}</span>
+          <span class="name">${escapeHtml(r.name)}</span>
+          <span class="pts">${r.gold}g · ${r.kills}k</span>
+        </div>`).join("")}
+    `;
+
+    hud.innerHTML = `
+      <div class="hud-help">
+        <b>WASD</b> move · <b>LMB</b> attack · <b>Space</b> attack · <b>RMB</b> dash · <b>Shift</b> sprint · <b>1..8</b> use slot · <b>E</b> equip · <b>Q</b> heal
+      </div>`;
+  }
+
+  private renderEquip(self: any) {
+    if (!self?.equipped) return;
+    const slots = ["weapon", "armor", "ring"];
+    equipPanel.innerHTML = `
+      <div class="panel-head">EQUIPPED</div>
+      ${slots.map((s) => {
+        const it = self.equipped.get ? self.equipped.get(s) : undefined;
+        return it ? `
+          <div class="equip-row" data-slot="${s}">
+            <div class="equip-slot">${s}</div>
+            <div class="equip-item" style="color:${RARITY_COLORS[it.rarity] || "#c7b99a"}">${escapeHtml(it.name)}</div>
+            <div class="equip-stats">${summariseItem(it)}</div>
+          </div>` : `
+          <div class="equip-row empty" data-slot="${s}">
+            <div class="equip-slot">${s}</div>
+            <div class="equip-item">— empty —</div>
+          </div>`;
+      }).join("")}
+    `;
+  }
+
+  private renderPack(self: any) {
+    if (!self?.pack) return;
+    const packLen = self.pack.length;
+    packPanel.innerHTML = `
+      <div class="panel-head">PACK · ${packLen}/8</div>
+      <div class="pack-grid">
+        ${Array.from({ length: 8 }).map((_, i) => {
+          const it = self.pack.at ? self.pack.at(i) : undefined;
+          if (!it) return `<div class="pack-slot empty"><span class="idx">${i + 1}</span></div>`;
+          const c = RARITY_COLORS[it.rarity] || "#c7b99a";
+          return `
+            <div class="pack-slot" data-idx="${i}" title="${escapeHtml(it.name)} · ${summariseItem(it)}">
+              <span class="idx">${i + 1}</span>
+              <span class="pack-name" style="color:${c}">${escapeHtml(it.name)}</span>
+              <span class="pack-stats">${summariseItem(it)}</span>
+            </div>`;
+        }).join("")}
+      </div>
+      <div class="panel-foot">Press <b>1..8</b> to equip/use · <b>E</b> equip first · <b>Q</b> use potion</div>
+    `;
+  }
+
+  // =======================================================================
+  // FX queue drain (damage numbers etc.)
+  // =======================================================================
+  private drainFx() {
+    while (pendingFx.length > 0) {
+      const fx = pendingFx.shift()!;
+      if (fx.t === "hit") {
+        this.floatText(fx.x, fx.y, `-${fx.amount}`, "#ffe0a8", 14);
+        this.cameras.main.shake(80, 0.002);
+      } else if (fx.t === "heal") {
+        this.floatText(fx.x, fx.y, `+${fx.amount}`, "#a6e3a1", 14);
+      } else if (fx.t === "death") {
+        this.floatText(fx.x, fx.y, `${fx.name} fell`, "#ef476f", 18);
+        this.cameras.main.shake(200, 0.004);
+      }
+    }
+  }
+
+  private floatText(x: number, y: number, text: string, color: string, size = 14) {
+    const t = this.add.text(x, y, text, {
+      fontFamily: "Georgia,serif", fontSize: `${size}px`, color,
+      stroke: "#1a1108", strokeThickness: 4, fontStyle: "bold",
+    }).setOrigin(0.5, 1).setDepth(220);
+    this.tweens.add({ targets: t, y: y - 36, alpha: 0, duration: 900, ease: "Sine.easeOut", onComplete: () => t.destroy() });
+  }
+
+  // =======================================================================
+  // Collision / reconciliation
   // =======================================================================
   private collidesAt(px: number, py: number): boolean {
     const w = PLAYER_SIZE, h = PLAYER_SIZE;
@@ -1189,7 +884,7 @@ class GameScene extends Phaser.Scene {
       if (input.left) dx -= 1; if (input.right) dx += 1;
       if (input.up) dy -= 1; if (input.down) dy += 1;
       if (dx !== 0 && dy !== 0) { const inv = 1 / Math.sqrt(2); dx *= inv; dy *= inv; }
-      const speed = (input.sprint ? PLAYER_SPRINT_SPEED : PLAYER_WALK_SPEED) * (this.selfPackage.visible ? 0.92 : 1);
+      const speed = (input.sprint ? PLAYER_SPRINT_SPEED : PLAYER_WALK_SPEED);
       const stepX = dx * speed * input.dt;
       const stepY = dy * speed * input.dt;
       let nx = x + stepX;
@@ -1199,151 +894,23 @@ class GameScene extends Phaser.Scene {
     }
     const dx = x - this.selfPredicted.x, dy = y - this.selfPredicted.y;
     const err = Math.sqrt(dx * dx + dy * dy);
-    if (err > 60) { this.selfPredicted.x = x; this.selfPredicted.y = y; }
+    if (err > 80) { this.selfPredicted.x = x; this.selfPredicted.y = y; }
     else { this.selfPredicted.x += dx * 0.3; this.selfPredicted.y += dy * 0.3; }
   }
 
-  // =======================================================================
-  // HUD / Waypoint / Minimap
-  // =======================================================================
-  private renderHud() {
-    if (!room) return;
-    const state: any = room.state;
-    if (!state?.players?.get) return;
-    const self = state.players.get(selfId);
-    if (!self) return;
-
-    const rank = rankFor(self.score || 0);
-    const best = getBestScore();
-    if (self.score > best) setBestScore(self.score);
-
-    scoreCard.innerHTML = `
-      <div class="score-num">${self.score || 0}<span class="unit">marka</span></div>
-      <div class="score-rank">${rank}</div>
-      <div class="score-sub">deliveries: ${self.deliveries || 0} · best: ${Math.max(best, self.score || 0)}${self.combo > 0 ? ` · <span class="combo">×${self.combo} combo</span>` : ""}</div>
-    `;
-
-    // Active order card
-    let activeOrder: any = null;
-    if (self.carryingOrderId && state.orders?.get) activeOrder = state.orders.get(self.carryingOrderId);
-    if (activeOrder) {
-      const toNpc = state.npcs?.get?.(activeOrder.toNpcId);
-      const timeLeft = Math.max(0, Math.floor((activeOrder.expiresAt - (state.serverNow || Date.now())) / 1000));
-      const pct = Math.max(0, Math.min(100, (timeLeft / 60) * 100));
-      orderCard.style.display = "block";
-      orderCard.innerHTML = `
-        <div class="order-head">CARRYING</div>
-        <div class="order-body">${activeOrder.itemEn} → <b>${toNpc?.shortName || "?"}</b></div>
-        <div class="timer-bar"><div class="fill" style="width:${pct}%; background:${timeLeft < 10 ? "#ef476f" : timeLeft < 20 ? "#f4a261" : "#2a9d8f"}"></div></div>
-        <div class="order-foot">${timeLeft}s · +${activeOrder.reward} marka</div>
-      `;
-    } else {
-      // Show available orders summary (nearest)
-      const ordersMap: any[] = state.orders?.values ? Array.from(state.orders.values()) : [];
-      const availableCount = ordersMap.filter((o: any) => o.status === "available").length;
-      if (availableCount > 0) {
-        orderCard.style.display = "block";
-        orderCard.innerHTML = `
-          <div class="order-head">AVAILABLE</div>
-          <div class="order-body">${availableCount} NPC${availableCount === 1 ? "" : "s"} with <b>!</b> — walk up to accept</div>
-        `;
-      } else {
-        orderCard.style.display = "none";
-      }
-    }
-
-    // Stamina
-    stamBarEl.style.width = `${Math.max(0, Math.min(100, self.stamina * 100))}%`;
-    if (self.stamina < 0.15) stamBarEl.classList.add("low"); else stamBarEl.classList.remove("low");
-
-    // Leaderboard
-    const rows: Array<{ name: string; score: number; mine: boolean }> = [];
-    if (state.players?.forEach) {
-      state.players.forEach((p: any, sid: string) => {
-        rows.push({ name: p.name || sid.slice(0, 4), score: p.score || 0, mine: sid === selfId });
-      });
-    }
-    rows.sort((a, b) => b.score - a.score);
-    leaderboard.innerHTML = `
-      <div class="lb-head">Kaupmehed</div>
-      ${rows.slice(0, 6).map((r, i) => `
-        <div class="lb-row ${r.mine ? "me" : ""}">
-          <span class="rank">${i + 1}</span>
-          <span class="name">${escapeHtml(r.name)}</span>
-          <span class="pts">${r.score}</span>
-        </div>`).join("")}
-    `;
-
-    hud.innerHTML = `
-      <div class="hud-help">
-        <b>WASD</b> move · <b>Shift</b> sprint · <b>Enter</b> chat · walk onto <span class="hud-bang">!</span> NPCs to take orders
-      </div>`;
+  private isSelfSafe(): boolean {
+    const tx = Math.floor((this.selfPredicted.x + PLAYER_SIZE / 2) / TILE_SIZE);
+    const ty = Math.floor((this.selfPredicted.y + PLAYER_SIZE / 2) / TILE_SIZE);
+    return isSafeTile(tx, ty);
   }
 
-  private updateWaypoint() {
-    if (!room) { this.waypointArrow.setVisible(false); return; }
-    const players = (room.state as any)?.players;
-    const orders = (room.state as any)?.orders;
-    const npcs = (room.state as any)?.npcs;
-    if (!players?.get || !orders?.get || !npcs?.get) { this.waypointArrow.setVisible(false); return; }
-    const self = players.get(selfId);
-    if (!self || !self.carryingOrderId) { this.waypointArrow.setVisible(false); return; }
-    const order = orders.get(self.carryingOrderId);
-    if (!order) { this.waypointArrow.setVisible(false); return; }
-    const dst = npcs.get(order.toNpcId);
-    if (!dst) { this.waypointArrow.setVisible(false); return; }
-
-    const cam = this.cameras.main;
-    const viewX = cam.scrollX + cam.width / 2 / cam.zoom;
-    const viewY = cam.scrollY + cam.height / 2 / cam.zoom;
-
-    const dx = dst.x - viewX, dy = dst.y - viewY;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    // If near, hide arrow (player can see destination)
-    if (dist < 220) { this.waypointArrow.setVisible(false); return; }
-
-    const angle = Math.atan2(dy, dx);
-    const margin = 50;
-    const viewW = cam.width;
-    const viewH = cam.height;
-    const halfW = viewW / 2 - margin, halfH = viewH / 2 - margin;
-    const tan = Math.abs(Math.tan(angle));
-    let ax = 0, ay = 0;
-    if (halfH / Math.max(0.0001, halfW) > tan) {
-      ax = Math.sign(Math.cos(angle)) * halfW;
-      ay = Math.tan(angle) * ax;
-    } else {
-      ay = Math.sign(Math.sin(angle)) * halfH;
-      ax = ay / Math.tan(angle);
-    }
-
-    this.waypointArrow.setVisible(true);
-    this.waypointArrow.setPosition(viewW / 2 + ax, viewH / 2 + ay);
-    this.waypointArrow.setRotation(angle);
-
-    this.waypointGraphics.clear();
-    this.waypointGraphics.fillStyle(0xe9c46a, 1);
-    this.waypointGraphics.beginPath();
-    this.waypointGraphics.moveTo(14, 0);
-    this.waypointGraphics.lineTo(-8, -8);
-    this.waypointGraphics.lineTo(-4, 0);
-    this.waypointGraphics.lineTo(-8, 8);
-    this.waypointGraphics.closePath();
-    this.waypointGraphics.fillPath();
-    this.waypointGraphics.lineStyle(1, 0x1a1108, 1);
-    this.waypointGraphics.strokePath();
-
-    this.waypointLabel.setText(`${dst.shortName} · ${Math.floor(dist / TILE_SIZE)}t`);
-    this.waypointLabel.setRotation(-angle);
-  }
-
+  // =======================================================================
+  // Minimap
+  // =======================================================================
   private drawMinimap() {
     const ctx = minimap.getContext("2d");
     if (!ctx) return;
-    const sx = minimap.width / MAP_W;
-    const sy = minimap.height / MAP_H;
-
-    // Background by tile category for readability
+    const sx = minimap.width / MAP_W, sy = minimap.height / MAP_H;
     for (let y = 0; y < MAP_H; y++) {
       for (let x = 0; x < MAP_W; x++) {
         const t = this.map[y][x];
@@ -1365,32 +932,32 @@ class GameScene extends Phaser.Scene {
         ctx.fillRect(x * sx, y * sy, Math.ceil(sx), Math.ceil(sy));
       }
     }
+    // Safe zone outline
+    ctx.strokeStyle = "#f4d58d";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(SAFE_ZONE.x0 * sx, SAFE_ZONE.y0 * sy, (SAFE_ZONE.x1 - SAFE_ZONE.x0 + 1) * sx, (SAFE_ZONE.y1 - SAFE_ZONE.y0 + 1) * sy);
 
     if (!room) return;
     const state: any = room.state;
-    // NPCs with orders
-    if (state?.npcs?.forEach) {
-      state.npcs.forEach((n: any) => {
-        if (!n.activeOrderId) return;
-        ctx.fillStyle = "#ffd166";
-        ctx.fillRect(((n.x / TILE_SIZE) * sx) - 1, ((n.y / TILE_SIZE) * sy) - 1, 3, 3);
+    // Enemies
+    if (state?.enemies?.forEach) {
+      state.enemies.forEach((e: any) => {
+        if (e.kind === "merchant") return;
+        if (e.state === "dead") return;
+        ctx.fillStyle = "#ef476f";
+        ctx.fillRect(((e.x / TILE_SIZE) * sx) - 1, ((e.y / TILE_SIZE) * sy) - 1, 2, 2);
       });
     }
-    // Self destination
-    const self = state?.players?.get?.(selfId);
-    if (self?.carryingOrderId) {
-      const o = state.orders?.get?.(self.carryingOrderId);
-      const dst = o ? state.npcs?.get?.(o.toNpcId) : null;
-      if (dst) {
-        ctx.strokeStyle = "#e9c46a";
-        ctx.lineWidth = 1.5;
-        ctx.strokeRect(((dst.x / TILE_SIZE) * sx) - 2, ((dst.y / TILE_SIZE) * sy) - 2, 5, 5);
-      }
+    // Loot
+    if (state?.loot?.forEach) {
+      state.loot.forEach((bag: any) => {
+        ctx.fillStyle = "#ffd166";
+        ctx.fillRect(((bag.x / TILE_SIZE) * sx) - 1, ((bag.y / TILE_SIZE) * sy) - 1, 2, 2);
+      });
     }
     // Remote players
     for (const [, r] of this.remotes) {
-      const last = r.buffer[r.buffer.length - 1];
-      if (!last) continue;
+      const last = r.buffer[r.buffer.length - 1]; if (!last) continue;
       ctx.fillStyle = r.color;
       ctx.fillRect(((last.x / TILE_SIZE) * sx) - 1, ((last.y / TILE_SIZE) * sy) - 1, 2, 2);
     }
@@ -1400,47 +967,363 @@ class GameScene extends Phaser.Scene {
   }
 
   // =======================================================================
-  // Juice helpers
+  // World render (baked texture)
   // =======================================================================
-  private burstCoinsAt(x: number, y: number) {
-    for (let i = 0; i < 10; i++) {
-      const p = this.add.rectangle(x, y, 4, 4, 0xe9c46a).setStrokeStyle(1, 0x5a3a22).setDepth(180);
-      const angle = (i / 10) * Math.PI * 2 + Math.random() * 0.4;
-      const dist = 28 + Math.random() * 20;
-      this.tweens.add({
-        targets: p,
-        x: x + Math.cos(angle) * dist,
-        y: y + Math.sin(angle) * dist - 12,
-        alpha: 0,
-        scale: 0.3,
-        duration: 600,
-        ease: "Cubic.easeOut",
-        onComplete: () => p.destroy(),
-      });
+  private drawWorldInto(worldPxW: number, worldPxH: number) {
+    const gfx = this.add.graphics({ x: 0, y: 0 }).setVisible(false);
+
+    for (let y = 0; y < MAP_H; y++) {
+      for (let x = 0; x < MAP_W; x++) {
+        const tile = this.map[y][x];
+        this.drawTile(gfx, x, y, tile);
+      }
+    }
+    for (const b of this.buildings) this.drawBuilding(gfx, b);
+    for (let y = 0; y < MAP_H; y++) {
+      for (let x = 0; x < MAP_W; x++) {
+        const tile = this.map[y][x];
+        if (tile === T.WELL) this.drawWell(gfx, x, y);
+        else if (tile === T.MARKET_STALL) this.drawMarketStall(gfx, x, y);
+        else if (tile === T.LANTERN) this.drawLantern(gfx, x, y);
+        else if (tile === T.TREE) this.drawTree(gfx, x, y);
+        else if (tile === T.STAIRS) this.drawStairs(gfx, x, y);
+      }
+    }
+
+    const key = "__tallinn_world";
+    if (this.textures.exists(key)) this.textures.remove(key);
+    gfx.generateTexture(key, worldPxW, worldPxH);
+    gfx.destroy();
+    this.add.image(0, 0, key).setOrigin(0, 0).setDepth(0);
+
+    for (const b of this.buildings) {
+      if (!b.showLabel) continue;
+      const cx = (b.x + b.w / 2) * TILE_SIZE;
+      const cy = (b.y + b.h / 2) * TILE_SIZE;
+      this.add.text(cx, cy + b.h * TILE_SIZE / 2 + 8, b.name, {
+        fontFamily: "serif", fontSize: "14px", color: "#f4d58d",
+        stroke: "#1a1108", strokeThickness: 3,
+      }).setOrigin(0.5).setAlpha(0.9).setDepth(50);
+    }
+    const areaLabels: Array<{ x: number; y: number; text: string; size?: number }> = [
+      { x: 28, y: 19, text: "Raekoja plats · SAFE", size: 18 },
+      { x: 8,  y: 8,  text: "Toompea",       size: 14 },
+      { x: 25, y: 1,  text: "Viru värav",    size: 12 },
+      { x: 15, y: 38, text: "Harju värav",   size: 12 },
+    ];
+    for (const l of areaLabels) {
+      this.add.text(l.x * TILE_SIZE, l.y * TILE_SIZE, l.text, {
+        fontFamily: "serif", fontSize: `${l.size || 13}px`, color: "#f4d58d",
+        stroke: "#1a1108", strokeThickness: 3,
+      }).setOrigin(0.5).setAlpha(0.75).setDepth(48);
     }
   }
 
-  private floatText(x: number, y: number, text: string, color: string, size = 14) {
-    const t = this.add.text(x, y, text, {
-      fontFamily: "Georgia,serif", fontSize: `${size}px`, color,
-      stroke: "#1a1108", strokeThickness: 4, fontStyle: "bold",
-    }).setOrigin(0.5, 1).setDepth(220);
-    this.tweens.add({
-      targets: t,
-      y: y - 40,
-      alpha: 0,
-      duration: 1100,
-      ease: "Sine.easeOut",
-      onComplete: () => t.destroy(),
-    });
+  private drawTile(g: Phaser.GameObjects.Graphics, x: number, y: number, tile: number) {
+    const px = x * TILE_SIZE, py = y * TILE_SIZE;
+    const base = TILE_BASE_COLORS[tile] ?? 0x000000;
+    g.fillStyle(base, 1);
+    g.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+
+    switch (tile) {
+      case T.STREET: {
+        const seed = (x * 73856093) ^ (y * 19349663);
+        g.fillStyle(0x4d4335, 1);
+        for (let i = 0; i < 5; i++) {
+          const rx = ((seed >>> (i * 3)) & 31);
+          const ry = ((seed >>> (i * 5 + 3)) & 31);
+          g.fillRect(px + rx, py + ry, 3, 3);
+        }
+        g.fillStyle(0x7a6a54, 0.8);
+        g.fillRect(px + 4, py + 6, 4, 3);
+        g.fillRect(px + 18, py + 20, 5, 3);
+        break;
+      }
+      case T.PLAZA: {
+        const seed = (x * 73856093) ^ (y * 19349663);
+        g.fillStyle(0x776553, 1);
+        for (let i = 0; i < 4; i++) {
+          const rx = 2 + ((seed >>> (i * 4)) & 27);
+          const ry = 2 + ((seed >>> (i * 5 + 2)) & 27);
+          g.fillRect(px + rx, py + ry, 4, 2);
+        }
+        g.fillStyle(0x9d8e72, 0.9);
+        g.fillRect(px + 10, py + 4, 6, 2);
+        g.fillRect(px + 2, py + 20, 5, 2);
+        g.fillRect(px + 22, py + 14, 5, 2);
+        g.lineStyle(1, 0xc0a87d, 0.18);
+        g.beginPath(); g.moveTo(px, py + 16); g.lineTo(px + TILE_SIZE, py + 16); g.strokePath();
+        break;
+      }
+      case T.TOOMPEA_GROUND: {
+        g.fillStyle(0x6d5a45, 1);
+        g.fillRect(px + 3, py + 3, 8, 8);
+        g.fillRect(px + 16, py + 6, 10, 8);
+        g.fillRect(px + 6, py + 18, 10, 10);
+        g.fillStyle(0xa28566, 0.6);
+        g.fillRect(px + 8, py + 5, 3, 2);
+        g.fillRect(px + 20, py + 10, 3, 2);
+        break;
+      }
+      case T.GRASS: {
+        g.fillStyle(0x546b35, 1);
+        g.fillRect(px + 4, py + 10, 3, 2);
+        g.fillRect(px + 18, py + 20, 3, 2);
+        g.fillRect(px + 12, py + 4, 3, 2);
+        break;
+      }
+      case T.WALL: {
+        g.fillStyle(0x554638, 1);
+        g.fillRect(px + 1, py + 1, TILE_SIZE - 2, TILE_SIZE - 2);
+        g.fillStyle(0x35281e, 1);
+        for (let ly = 0; ly < TILE_SIZE; ly += 8) g.fillRect(px, py + ly, TILE_SIZE, 1);
+        for (let lx = 0; lx < TILE_SIZE; lx += 10) g.fillRect(px + lx, py, 1, TILE_SIZE);
+        g.fillStyle(0x7a6850, 0.35);
+        g.fillRect(px + 2, py + 2, TILE_SIZE - 4, 2);
+        if (y === 0 || x === 0 || y === MAP_H - 1 || x === MAP_W - 1) {
+          g.fillStyle(0x1f1a14, 1);
+          for (let cx = 0; cx < TILE_SIZE; cx += 8) g.fillRect(px + cx, py, 4, 4);
+        }
+        break;
+      }
+      case T.CASTLE_WALL: {
+        g.fillStyle(0x3f3227, 1);
+        g.fillRect(px + 1, py + 1, TILE_SIZE - 2, TILE_SIZE - 2);
+        g.fillStyle(0x26190f, 1);
+        g.fillRect(px + 6, py + 4, 4, 5);
+        g.fillRect(px + 20, py + 10, 4, 5);
+        g.fillStyle(0x5d4a38, 0.35);
+        g.fillRect(px + 2, py + 2, TILE_SIZE - 4, 2);
+        break;
+      }
+      case T.GATE: {
+        g.fillStyle(0x5a4232, 1);
+        g.fillRect(px + 3, py + 3, TILE_SIZE - 6, TILE_SIZE - 6);
+        g.fillStyle(0x1e140c, 1);
+        g.fillRect(px + 10, py + 10, TILE_SIZE - 20, TILE_SIZE - 12);
+        g.lineStyle(1, 0x7c6449, 1);
+        g.strokeRect(px + 10, py + 10, TILE_SIZE - 20, TILE_SIZE - 12);
+        break;
+      }
+      case T.WATER: {
+        g.fillStyle(0x294863, 1);
+        g.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+        g.fillStyle(0x3a6389, 0.9);
+        g.fillRect(px + 2, py + 10, TILE_SIZE - 4, 3);
+        break;
+      }
+    }
   }
 
-  private screenFlash(color: string, duration = 150) {
-    const cam = this.cameras.main;
-    const r = this.add.rectangle(cam.scrollX, cam.scrollY, cam.width / cam.zoom, cam.height / cam.zoom,
-      Phaser.Display.Color.HexStringToColor(color).color, 0.35)
-      .setOrigin(0, 0).setDepth(400).setScrollFactor(0);
-    r.setSize(this.scale.width, this.scale.height);
-    this.tweens.add({ targets: r, alpha: 0, duration, onComplete: () => r.destroy() });
+  private drawBuilding(g: Phaser.GameObjects.Graphics, b: Building) {
+    const px = b.x * TILE_SIZE, py = b.y * TILE_SIZE;
+    const w = b.w * TILE_SIZE, h = b.h * TILE_SIZE;
+    switch (b.style) {
+      case "merchant":     return this.drawMerchantHouse(g, b, px, py, w, h);
+      case "townhall":     return this.drawTownHall(g, b, px, py, w, h);
+      case "oleviste":     return this.drawOleviste(g, b, px, py, w, h);
+      case "pikkhermann":  return this.drawPikkHermann(g, b, px, py, w, h);
+      case "domechurch":   return this.drawDomeChurch(g, b, px, py, w, h);
+    }
   }
+
+  private drawMerchantHouse(g: Phaser.GameObjects.Graphics, b: Building, px: number, py: number, w: number, h: number) {
+    const facade = Phaser.Display.Color.HexStringToColor(b.facade || "#d8a785").color;
+    const roof = Phaser.Display.Color.HexStringToColor(b.roof || "#8e3b26").color;
+    const accent = Phaser.Display.Color.HexStringToColor(b.accent || "#5a2f20").color;
+    g.fillStyle(facade, 1); g.fillRect(px + 2, py + 6, w - 4, h - 8);
+    g.fillStyle(accent, 0.25);
+    for (let sx = 8; sx < w - 4; sx += 10) g.fillRect(px + sx, py + 6, 1, h - 8);
+    const winCols = Math.max(2, Math.floor((w - 6) / 10));
+    const winRowsN = Math.max(1, Math.floor((h - 14) / 10));
+    for (let r = 0; r < winRowsN; r++) {
+      for (let c = 0; c < winCols; c++) {
+        const wx = px + 6 + c * ((w - 8) / winCols);
+        const wy = py + 10 + r * 10;
+        g.fillStyle(0xd9b26a, 0.85); g.fillRect(wx, wy, 6, 5);
+        g.fillStyle(accent, 0.8); g.fillRect(wx + 2, wy, 2, 5); g.fillRect(wx, wy + 2, 6, 1);
+      }
+    }
+    g.fillStyle(accent, 1); g.fillRect(px + w / 2 - 3, py + h - 10, 6, 8);
+    if (b.gable === "stepped") {
+      const steps = Math.min(4, Math.max(2, Math.floor(w / 12)));
+      const stepW = Math.floor((w - 6) / (steps * 2 + 1));
+      g.fillStyle(roof, 1); g.fillRect(px + 2, py + 2, w - 4, 5);
+      for (let i = 0; i < steps; i++) {
+        const leftX = px + 2 + stepW * (i + 1);
+        const rightX = px + w - 2 - stepW * (i + 1) - stepW;
+        const h2 = 4 + i * 3;
+        g.fillRect(leftX, py - h2, stepW, h2 + 4);
+        g.fillRect(rightX, py - h2, stepW, h2 + 4);
+      }
+      g.fillRect(px + w / 2 - stepW / 2, py - (4 + steps * 3) - 2, stepW, 6);
+    } else {
+      g.fillStyle(roof, 1); g.fillRect(px + 2, py + 2, w - 4, 5);
+      g.fillTriangle(px + 2, py + 2, px + w - 2, py + 2, px + w / 2, py - 8);
+    }
+    g.fillStyle(0x1b0f09, 0.3); g.fillRect(px + 2, py + h - 3, w - 4, 2);
+  }
+
+  private drawTownHall(g: Phaser.GameObjects.Graphics, b: Building, px: number, py: number, w: number, h: number) {
+    const facade = Phaser.Display.Color.HexStringToColor(b.facade || "#d8cfae").color;
+    const roof = Phaser.Display.Color.HexStringToColor(b.roof || "#8e3b26").color;
+    const accent = Phaser.Display.Color.HexStringToColor(b.accent || "#5a4a30").color;
+    g.fillStyle(facade, 1); g.fillRect(px + 2, py + 16, w - 4, h - 18);
+    const archCount = 6; const archW = (w - 8) / archCount;
+    for (let i = 0; i < archCount; i++) {
+      const ax = px + 4 + i * archW;
+      g.fillStyle(accent, 0.9); g.fillRect(ax + 1, py + h - 18, archW - 2, 16);
+      g.fillStyle(0x1b130b, 1); g.fillRect(ax + 3, py + h - 15, archW - 6, 10);
+      g.fillStyle(accent, 1);
+      g.fillTriangle(ax + 3, py + h - 15, ax + archW - 3, py + h - 15, ax + archW / 2, py + h - 20);
+    }
+    for (let r = 0; r < 2; r++) for (let i = 0; i < 8; i++) {
+      const wx = px + 5 + i * ((w - 10) / 8); const wy = py + 20 + r * 14;
+      g.fillStyle(0xd9b26a, 0.9); g.fillRect(wx, wy, 4, 10);
+      g.fillStyle(accent, 0.9); g.fillRect(wx + 2, wy, 1, 10); g.fillRect(wx, wy + 4, 4, 1);
+    }
+    g.fillStyle(roof, 1); g.fillRect(px + 2, py + 12, w - 4, 6);
+    const steps = 5; const stepW = Math.floor((w - 4) / (steps * 2 + 1));
+    for (let i = 0; i < steps; i++) {
+      const leftX = px + 2 + stepW * (i + 1);
+      const rightX = px + w - 2 - stepW * (i + 1) - stepW;
+      const hUp = 4 + i * 4;
+      g.fillRect(leftX, py + 12 - hUp, stepW, hUp + 4);
+      g.fillRect(rightX, py + 12 - hUp, stepW, hUp + 4);
+    }
+    const towerX = px + w * 0.18;
+    const towerW = Math.max(22, Math.floor(w * 0.17));
+    const spireH = b.spire || 140;
+    const towerTopY = py - spireH;
+    g.fillStyle(facade, 1); g.fillRect(towerX - towerW / 2, towerTopY + 34, towerW, spireH - 34);
+    g.fillStyle(accent, 0.3);
+    g.fillRect(towerX - towerW / 2, towerTopY + 34, 2, spireH - 34);
+    g.fillRect(towerX + towerW / 2 - 2, towerTopY + 34, 2, spireH - 34);
+    g.fillStyle(0xe7c258, 1); g.fillCircle(towerX, towerTopY + 80, 7);
+    g.fillStyle(0x1b130b, 1); g.fillCircle(towerX, towerTopY + 80, 5);
+    g.lineStyle(1, 0xe7c258, 1);
+    g.beginPath(); g.moveTo(towerX, towerTopY + 80); g.lineTo(towerX + 3, towerTopY + 78); g.strokePath();
+    g.beginPath(); g.moveTo(towerX, towerTopY + 80); g.lineTo(towerX, towerTopY + 76); g.strokePath();
+    for (let i = 0; i < 3; i++) { g.fillStyle(0x1b130b, 1); g.fillRect(towerX - 2, towerTopY + 40 + i * 20, 4, 6); }
+    g.fillStyle(0x8a7050, 1); g.fillRect(towerX - towerW / 2 - 2, towerTopY + 30, towerW + 4, 6);
+    g.fillStyle(0x3a6b5a, 1);
+    g.fillTriangle(towerX - towerW / 2 + 2, towerTopY + 34, towerX + towerW / 2 - 2, towerTopY + 34, towerX, towerTopY - 6);
+    g.fillStyle(0x5a8e77, 0.7);
+    g.fillTriangle(towerX - towerW / 2 + 4, towerTopY + 34, towerX, towerTopY + 34, towerX - 1, towerTopY - 2);
+    g.fillStyle(0x2a1408, 1); g.fillRect(towerX - 1, towerTopY - 20, 2, 18);
+    g.fillStyle(0xd9a74a, 1);
+    g.fillRect(towerX - 5, towerTopY - 26, 10, 3);
+    g.fillRect(towerX - 2, towerTopY - 30, 3, 5);
+    g.fillRect(towerX - 3, towerTopY - 32, 5, 3);
+    g.fillStyle(0x0f0907, 0.4); g.fillRect(px + 2, py + h - 3, w - 4, 2);
+  }
+
+  private drawOleviste(g: Phaser.GameObjects.Graphics, b: Building, px: number, py: number, w: number, h: number) {
+    const facade = Phaser.Display.Color.HexStringToColor(b.facade || "#9b8a78").color;
+    const roof = Phaser.Display.Color.HexStringToColor(b.roof || "#3a2418").color;
+    g.fillStyle(facade, 1); g.fillRect(px + 2, py + 24, w - 4, h - 26);
+    for (let i = 0; i < 3; i++) {
+      const wx = px + 4 + i * ((w - 8) / 3);
+      g.fillStyle(0x1b130b, 1); g.fillRect(wx, py + 30, 4, 14);
+      g.fillTriangle(wx, py + 30, wx + 4, py + 30, wx + 2, py + 26);
+    }
+    const centerX = px + w / 2;
+    const towerW = Math.max(24, w * 0.4);
+    const spireH = b.spire || 200;
+    const baseTop = py + 18;
+    g.fillStyle(facade, 1); g.fillRect(centerX - towerW / 2, baseTop - spireH + 40, towerW, spireH + 10);
+    g.fillStyle(0x6a5a48, 1);
+    for (let i = 0; i < 6; i++) g.fillRect(centerX - towerW / 2, baseTop - spireH + 60 + i * 22, towerW, 2);
+    for (let i = 0; i < 4; i++) { g.fillStyle(0x1b130b, 1); g.fillRect(centerX - 3, baseTop - spireH + 70 + i * 30, 6, 10); }
+    g.fillStyle(roof, 1);
+    g.fillTriangle(centerX - towerW / 2 + 2, baseTop - spireH + 40, centerX + towerW / 2 - 2, baseTop - spireH + 40, centerX, baseTop - spireH - 30);
+    g.fillStyle(0x5a3a28, 0.7);
+    g.fillTriangle(centerX - towerW / 2 + 4, baseTop - spireH + 40, centerX, baseTop - spireH + 40, centerX - 2, baseTop - spireH - 20);
+    g.fillStyle(0xd9a74a, 1);
+    g.fillRect(centerX - 1, baseTop - spireH - 40, 2, 14);
+    g.fillRect(centerX - 5, baseTop - spireH - 32, 10, 2);
+    g.fillStyle(roof, 1); g.fillRect(px + 2, py + 20, w - 4, 4);
+    g.fillTriangle(px + 2, py + 20, px + w - 2, py + 20, px + w / 2, py + 14);
+    g.fillStyle(0x0f0907, 0.4); g.fillRect(px + 2, py + h - 3, w - 4, 2);
+  }
+
+  private drawPikkHermann(g: Phaser.GameObjects.Graphics, b: Building, px: number, py: number, w: number, h: number) {
+    const facade = Phaser.Display.Color.HexStringToColor(b.facade || "#6a6058").color;
+    const spireH = b.spire || 80;
+    const centerX = px + w / 2;
+    const baseW = w - 6;
+    g.fillStyle(facade, 1); g.fillRect(px + 3, py + 6, baseW, h - 8);
+    g.fillRect(centerX - baseW / 2 - 2, py + 10, baseW + 4, h - 14);
+    g.fillStyle(0x3e3730, 1);
+    for (let i = 0; i < 6; i++) g.fillRect(px + 3, py + 8 + i * 10, baseW, 1);
+    for (let i = 0; i < 4; i++) { g.fillStyle(0x15110d, 1); g.fillRect(centerX - 1, py + 14 + i * 14, 2, 8); }
+    g.fillStyle(facade, 1); g.fillRect(centerX - 8, py + 6 - spireH, 16, spireH + 6);
+    g.fillStyle(0x25201a, 1);
+    for (let cx = -8; cx < 10; cx += 4) g.fillRect(centerX + cx, py + 6 - spireH - 4, 2, 6);
+    g.fillStyle(0x1b130b, 1); g.fillRect(centerX - 1, py - spireH - 14, 2, 10);
+    g.fillStyle(0x0f4da2, 1); g.fillRect(centerX + 1, py - spireH - 14, 14, 3);
+    g.fillStyle(0x111111, 1); g.fillRect(centerX + 1, py - spireH - 11, 14, 3);
+    g.fillStyle(0xf0efe8, 1); g.fillRect(centerX + 1, py - spireH - 8, 14, 3);
+  }
+
+  private drawDomeChurch(g: Phaser.GameObjects.Graphics, b: Building, px: number, py: number, w: number, h: number) {
+    const facade = Phaser.Display.Color.HexStringToColor(b.facade || "#e4dcc9").color;
+    const roof = Phaser.Display.Color.HexStringToColor(b.roof || "#7a3321").color;
+    g.fillStyle(facade, 1); g.fillRect(px + 2, py + 10, w - 4, h - 12);
+    g.fillStyle(0xffffff, 0.15); g.fillRect(px + 2, py + 12, w - 4, 2);
+    g.fillStyle(roof, 1); g.fillRect(px + 2, py + 6, w - 4, 6);
+    g.fillTriangle(px + 2, py + 6, px + w - 2, py + 6, px + w / 2, py - 6);
+    const centerX = px + w / 2;
+    g.fillStyle(facade, 1); g.fillRect(centerX - 8, py - 26, 16, 30);
+    g.fillStyle(0x7a3321, 1); g.fillEllipse(centerX, py - 32, 20, 16);
+    g.fillStyle(0xd9a74a, 1); g.fillRect(centerX - 1, py - 46, 2, 12);
+    g.fillRect(centerX - 1, py - 54, 2, 8); g.fillRect(centerX - 4, py - 50, 8, 2);
+  }
+
+  private drawWell(g: Phaser.GameObjects.Graphics, x: number, y: number) {
+    const cx = x * TILE_SIZE + TILE_SIZE / 2, cy = y * TILE_SIZE + TILE_SIZE / 2;
+    g.fillStyle(0x4a4138, 1); g.fillCircle(cx, cy, 11);
+    g.fillStyle(0x1a1510, 1); g.fillCircle(cx, cy, 7);
+    g.fillStyle(0x5a4b3b, 1); g.fillRect(cx - 2, cy - 16, 4, 10); g.fillRect(cx - 10, cy - 16, 20, 3);
+    g.fillStyle(0x2a1a10, 1); g.fillRect(cx - 2, cy - 10, 4, 6);
+  }
+  private drawMarketStall(g: Phaser.GameObjects.Graphics, x: number, y: number) {
+    const px = x * TILE_SIZE, py = y * TILE_SIZE;
+    const tarp = [0xa3786a, 0xb8914a, 0x6b8a6a, 0x7b6a9a][(x + y) % 4];
+    g.fillStyle(0x3e2a1c, 1); g.fillRect(px + 4, py + 10, TILE_SIZE - 8, 8);
+    g.fillStyle(tarp, 1); g.fillRect(px + 2, py + 4, TILE_SIZE - 4, 8);
+    g.fillStyle(0x1a1108, 0.5);
+    for (let i = 0; i < 5; i++) g.fillRect(px + 4 + i * 5, py + 12, 2, 2);
+  }
+  private drawLantern(g: Phaser.GameObjects.Graphics, x: number, y: number) {
+    const cx = x * TILE_SIZE + TILE_SIZE / 2, py = y * TILE_SIZE;
+    g.fillStyle(0x2a1a10, 1); g.fillRect(cx - 1, py + 10, 2, 18);
+    g.fillStyle(0xe7c258, 1); g.fillRect(cx - 4, py + 6, 8, 6);
+    g.fillStyle(0x2a1a10, 1); g.fillRect(cx - 1, py + 4, 2, 3);
+  }
+  private drawTree(g: Phaser.GameObjects.Graphics, x: number, y: number) {
+    const cx = x * TILE_SIZE + TILE_SIZE / 2, cy = y * TILE_SIZE + TILE_SIZE / 2;
+    g.fillStyle(0x1f3b1a, 1); g.fillCircle(cx, cy, 12);
+    g.fillStyle(0x2f5a24, 1); g.fillCircle(cx - 3, cy - 3, 8);
+    g.fillStyle(0x2a1a10, 1); g.fillRect(cx - 2, cy + 8, 4, 6);
+  }
+  private drawStairs(g: Phaser.GameObjects.Graphics, x: number, y: number) {
+    const px = x * TILE_SIZE, py = y * TILE_SIZE;
+    g.fillStyle(0x7e6a50, 1); g.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+    g.fillStyle(0x4a3a28, 1);
+    for (let i = 0; i < 4; i++) g.fillRect(px + 2, py + 4 + i * 7, TILE_SIZE - 4, 2);
+    g.fillStyle(0xaa9070, 0.5); g.fillRect(px + 2, py + 2, TILE_SIZE - 4, 1);
+  }
+}
+
+// Utility for item summaries (client-side, mirrors server/items summariseItem).
+function summariseItem(it: any): string {
+  const parts: string[] = [];
+  if (it.damage) parts.push(`DMG ${it.damage}`);
+  if (it.defense) parts.push(`DEF ${it.defense}`);
+  if (it.bonusHp) parts.push(`HP +${it.bonusHp}`);
+  if (it.bonusSpeed) parts.push(`SPD ${it.bonusSpeed > 0 ? "+" : ""}${Math.round(it.bonusSpeed * 100)}%`);
+  if (it.bonusDamagePct) parts.push(`DMG +${Math.round(it.bonusDamagePct * 100)}%`);
+  if (it.healAmount) parts.push(`HEAL ${it.healAmount}`);
+  return parts.join(" · ");
 }

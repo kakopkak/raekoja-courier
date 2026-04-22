@@ -364,51 +364,79 @@ export function generateBuildings(): Building[] {
   return bs;
 }
 
+// Plaza hub NPCs — pure flavor. They stand around for atmosphere, no quests.
+// A couple of them are vendors (see room logic); the rest are decoration.
 export function getNpcDefs(): NpcDef[] {
   return [
-    { id: "npc_pagar",      name: "Pagar Mart",        shortName: "Pagar",        role: "baker",     x: 23, y: 16, building: "pagar" },
-    { id: "npc_kangur",     name: "Kangur Tiina",      shortName: "Kangur",       role: "weaver",    x: 26, y: 16, building: "kangur" },
-    { id: "npc_kirjutaja",  name: "Kirjutaja Otto",    shortName: "Kirjutaja",    role: "scribe",    x: 32, y: 16, building: "kirjutaja" },
-    { id: "npc_sepp",       name: "Sepa Jakob",        shortName: "Sepp",         role: "smith",     x: 35, y: 17, building: "sepp" },
-    { id: "npc_apteeker",   name: "Apteeker Maria",    shortName: "Apteeker",     role: "apothecary",x: 20, y: 17, building: "apteek" },
-    { id: "npc_ollemeister",name: "Õllemeister Peep",  shortName: "Õllemeister",  role: "brewer",    x: 35, y: 23, building: "ollemeister" },
-    { id: "npc_parkal",     name: "Parkal Hans",       shortName: "Parkal",       role: "tanner",    x: 35, y: 20, building: "parkal" },
-    { id: "npc_kalamees",   name: "Kalamees Priit",    shortName: "Kalamees",     role: "fisherman", x: 35, y: 26, building: "kalamees" },
-    { id: "npc_kuulutaja",  name: "Kuulutaja Hendrik", shortName: "Kuulutaja",    role: "crier",     x: 28, y: 20, building: "raekoda" },
-    { id: "npc_vahtkond",   name: "Vahtkond Urmas",    shortName: "Vahtkond",     role: "guard",     x: 25, y: 3,  building: "raekoda" },
-    { id: "npc_preester",   name: "Preester Erik",     shortName: "Preester",     role: "priest",    x: 11, y: 12, building: "toomkirik" },
-    { id: "npc_oleviste",   name: "Vaga Olev",         shortName: "Vaga Olev",    role: "priest",    x: 42, y: 12, building: "oleviste" },
+    { id: "npc_sepp",       name: "Sepa Jakob",        shortName: "Smith",        role: "smith",     x: 35, y: 17, building: "sepp" },
+    { id: "npc_apteeker",   name: "Apteeker Maria",    shortName: "Apothecary",   role: "apothecary",x: 20, y: 17, building: "apteek" },
+    { id: "npc_ollemeister",name: "Õllemeister Peep",  shortName: "Brewer",       role: "brewer",    x: 35, y: 23, building: "ollemeister" },
+    { id: "npc_kuulutaja",  name: "Kuulutaja Hendrik", shortName: "Herald",       role: "crier",     x: 28, y: 20, building: "raekoda" },
+    { id: "npc_preester",   name: "Preester Erik",     shortName: "Priest",       role: "priest",    x: 11, y: 12, building: "toomkirik" },
   ];
 }
 
-// Items that can be delivered (Estonian flavor).
-export const ITEMS = [
-  { id: "rukkileib",  name: "rukkileib",    en: "rye loaf" },
-  { id: "ollevaat",   name: "õllevaat",     en: "ale cask" },
-  { id: "kirjarull",  name: "kirjarull",    en: "letter scroll" },
-  { id: "villakera",  name: "villakera",    en: "bundle of wool" },
-  { id: "kalapakk",   name: "kalapakk",     en: "smoked-fish pack" },
-  { id: "ravimitõrv", name: "ravimitõrv",   en: "herbal tincture" },
-  { id: "nahk",       name: "pargitud nahk",en: "tanned hide" },
-  { id: "raudnaelad", name: "raudnaelad",   en: "iron nails" },
-  { id: "vahapulgad", name: "vahapulgad",   en: "wax candles" },
-  { id: "soolaliha",  name: "soolaliha",    en: "salted pork" },
-];
+// ---------------------------------------------------------------------------
+// Safe zone (Raekoja plats + immediate hub). Inside this rectangle:
+//   - no enemy spawns
+//   - players cannot take damage (PvE or PvP)
+//   - extraction happens when a player crosses back in with a pack
+// ---------------------------------------------------------------------------
+export const SAFE_ZONE = { x0: 20, y0: 14, x1: 36, y1: 24 } as const;  // tile bounds (inclusive)
 
-// Ranks — progression label shown on the HUD.
-export const RANKS: Array<{ min: number; title: string }> = [
-  { min: 0,    title: "Õpipoiss" },       // Apprentice
-  { min: 30,   title: "Selli" },          // Journeyman
-  { min: 80,   title: "Meister" },        // Master
-  { min: 160,  title: "Gildivend" },      // Guild member
-  { min: 320,  title: "Hansakaupmees" },  // Hanseatic Trader
-  { min: 640,  title: "Rae sündik" },     // Syndic of the Council
-];
+export function isSafePx(px: number, py: number): boolean {
+  const tx = px / TILE_SIZE;
+  const ty = py / TILE_SIZE;
+  return tx >= SAFE_ZONE.x0 && tx <= SAFE_ZONE.x1 + 1 && ty >= SAFE_ZONE.y0 && ty <= SAFE_ZONE.y1 + 1;
+}
 
-export function rankFor(score: number): string {
-  let t = "Õpipoiss";
-  for (const r of RANKS) if (score >= r.min) t = r.title;
-  return t;
+export function isSafeTile(tx: number, ty: number): boolean {
+  return tx >= SAFE_ZONE.x0 && tx <= SAFE_ZONE.x1 && ty >= SAFE_ZONE.y0 && ty <= SAFE_ZONE.y1;
+}
+
+// Enemy spawn anchors — hand-picked walkable street/alley/courtyard tiles
+// spread around the city, biased AWAY from the plaza so the hub stays calm.
+export function getEnemyAnchors(): Array<{ x: number; y: number; kinds: string[] }> {
+  return [
+    // Toompea courtyard
+    { x: 7,  y: 6,  kinds: ["revenant", "bandit"] },
+    { x: 11, y: 5,  kinds: ["revenant"] },
+    { x: 5,  y: 9,  kinds: ["revenant", "archer"] },
+    { x: 12, y: 10, kinds: ["bandit", "archer"] },
+    // Between Toompea and plaza (streets around Pikk jalg)
+    { x: 16, y: 16, kinds: ["bandit", "revenant"] },
+    { x: 14, y: 22, kinds: ["bandit"] },
+    { x: 10, y: 22, kinds: ["revenant"] },
+    // South side
+    { x: 6,  y: 28, kinds: ["revenant", "bandit"] },
+    { x: 13, y: 32, kinds: ["bandit", "archer"] },
+    { x: 22, y: 32, kinds: ["revenant", "rival"] },
+    { x: 30, y: 32, kinds: ["bandit", "archer"] },
+    { x: 40, y: 32, kinds: ["revenant", "bandit"] },
+    // East / Oleviste district
+    { x: 40, y: 10, kinds: ["revenant", "archer", "rival"] },
+    { x: 47, y: 10, kinds: ["bandit", "archer"] },
+    { x: 47, y: 22, kinds: ["bandit", "rival"] },
+    { x: 47, y: 30, kinds: ["revenant"] },
+    // Outer lanes
+    { x: 4,  y: 18, kinds: ["bandit"] },
+    { x: 4,  y: 26, kinds: ["revenant"] },
+  ];
+}
+
+// Loot-chest anchors — places where rolls of loot bags can auto-spawn over time
+// (random treasure, not tied to enemies).
+export function getLootAnchors(): Array<{ x: number; y: number }> {
+  return [
+    { x: 7,  y: 8 },   // Toompea courtyard
+    { x: 11, y: 6 },
+    { x: 13, y: 22 },  // alley near Pikk jalg
+    { x: 8,  y: 30 },  // south side
+    { x: 22, y: 32 },
+    { x: 40, y: 6 },   // Oleviste gate area
+    { x: 44, y: 18 },  // east wall alley
+    { x: 40, y: 30 },
+  ];
 }
 
 // Player AABB + physical constants (shared so client prediction matches server).
