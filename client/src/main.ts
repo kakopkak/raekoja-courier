@@ -1208,7 +1208,9 @@ class GameScene extends Phaser.Scene {
   // =======================================================================
   private renderHud() {
     if (!room) return;
-    const self = (room.state as any).players.get(selfId);
+    const state: any = room.state;
+    if (!state?.players?.get) return;
+    const self = state.players.get(selfId);
     if (!self) return;
 
     const rank = rankFor(self.score || 0);
@@ -1223,10 +1225,10 @@ class GameScene extends Phaser.Scene {
 
     // Active order card
     let activeOrder: any = null;
-    if (self.carryingOrderId) activeOrder = (room.state as any).orders.get(self.carryingOrderId);
+    if (self.carryingOrderId && state.orders?.get) activeOrder = state.orders.get(self.carryingOrderId);
     if (activeOrder) {
-      const toNpc = (room.state as any).npcs.get(activeOrder.toNpcId);
-      const timeLeft = Math.max(0, Math.floor((activeOrder.expiresAt - ((room.state as any).serverNow || Date.now())) / 1000));
+      const toNpc = state.npcs?.get?.(activeOrder.toNpcId);
+      const timeLeft = Math.max(0, Math.floor((activeOrder.expiresAt - (state.serverNow || Date.now())) / 1000));
       const pct = Math.max(0, Math.min(100, (timeLeft / 60) * 100));
       orderCard.style.display = "block";
       orderCard.innerHTML = `
@@ -1237,7 +1239,8 @@ class GameScene extends Phaser.Scene {
       `;
     } else {
       // Show available orders summary (nearest)
-      const availableCount = Array.from((room.state as any).orders.values()).filter((o: any) => o.status === "available").length;
+      const ordersMap: any[] = state.orders?.values ? Array.from(state.orders.values()) : [];
+      const availableCount = ordersMap.filter((o: any) => o.status === "available").length;
       if (availableCount > 0) {
         orderCard.style.display = "block";
         orderCard.innerHTML = `
@@ -1255,9 +1258,11 @@ class GameScene extends Phaser.Scene {
 
     // Leaderboard
     const rows: Array<{ name: string; score: number; mine: boolean }> = [];
-    (room.state as any).players.forEach((p: any, sid: string) => {
-      rows.push({ name: p.name || sid.slice(0, 4), score: p.score || 0, mine: sid === selfId });
-    });
+    if (state.players?.forEach) {
+      state.players.forEach((p: any, sid: string) => {
+        rows.push({ name: p.name || sid.slice(0, 4), score: p.score || 0, mine: sid === selfId });
+      });
+    }
     rows.sort((a, b) => b.score - a.score);
     leaderboard.innerHTML = `
       <div class="lb-head">Kaupmehed</div>
@@ -1277,11 +1282,15 @@ class GameScene extends Phaser.Scene {
 
   private updateWaypoint() {
     if (!room) { this.waypointArrow.setVisible(false); return; }
-    const self = (room.state as any).players.get(selfId);
+    const players = (room.state as any)?.players;
+    const orders = (room.state as any)?.orders;
+    const npcs = (room.state as any)?.npcs;
+    if (!players?.get || !orders?.get || !npcs?.get) { this.waypointArrow.setVisible(false); return; }
+    const self = players.get(selfId);
     if (!self || !self.carryingOrderId) { this.waypointArrow.setVisible(false); return; }
-    const order = (room.state as any).orders.get(self.carryingOrderId);
+    const order = orders.get(self.carryingOrderId);
     if (!order) { this.waypointArrow.setVisible(false); return; }
-    const dst = (room.state as any).npcs.get(order.toNpcId);
+    const dst = npcs.get(order.toNpcId);
     if (!dst) { this.waypointArrow.setVisible(false); return; }
 
     const cam = this.cameras.main;
@@ -1358,17 +1367,20 @@ class GameScene extends Phaser.Scene {
     }
 
     if (!room) return;
+    const state: any = room.state;
     // NPCs with orders
-    (room.state as any).npcs.forEach((n: any) => {
-      if (!n.activeOrderId) return;
-      ctx.fillStyle = "#ffd166";
-      ctx.fillRect(((n.x / TILE_SIZE) * sx) - 1, ((n.y / TILE_SIZE) * sy) - 1, 3, 3);
-    });
+    if (state?.npcs?.forEach) {
+      state.npcs.forEach((n: any) => {
+        if (!n.activeOrderId) return;
+        ctx.fillStyle = "#ffd166";
+        ctx.fillRect(((n.x / TILE_SIZE) * sx) - 1, ((n.y / TILE_SIZE) * sy) - 1, 3, 3);
+      });
+    }
     // Self destination
-    const self = (room.state as any).players.get(selfId);
+    const self = state?.players?.get?.(selfId);
     if (self?.carryingOrderId) {
-      const o = (room.state as any).orders.get(self.carryingOrderId);
-      const dst = o ? (room.state as any).npcs.get(o.toNpcId) : null;
+      const o = state.orders?.get?.(self.carryingOrderId);
+      const dst = o ? state.npcs?.get?.(o.toNpcId) : null;
       if (dst) {
         ctx.strokeStyle = "#e9c46a";
         ctx.lineWidth = 1.5;
