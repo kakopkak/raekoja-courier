@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Raekoja Courier · Tallinn Online</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --ink: #f4e3c4;
+        --paper: #120e0a;
+        --gold: #e9c46a;
+        --warm-gold: #f4d58d;
+        --brick: #c2613a;
+        --green: #2a9d8f;
+        --red: #ef476f;
+        --muted: rgba(244,227,196,0.7);
+        --line: rgba(244,213,141,0.18);
+        --panel: rgba(20,16,12,0.85);
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0; padding: 0; height: 100%;
+        background: var(--paper);
+        color: var(--ink);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        overflow: hidden;
+      }
+      #app { position: fixed; inset: 0; overflow: hidden; }
+      #app canvas { image-rendering: pixelated; display: block; width: 100% !important; height: 100% !important; }
+
+      /* ============================== MENU ============================== */
+      #menu {
+        position: fixed; inset: 0;
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        background:
+          radial-gradient(circle at 50% 40%, rgba(76,44,24,0.85) 0%, rgba(8,6,4,0.98) 75%),
+          repeating-linear-gradient(45deg, #1c1510 0 2px, #17110c 2px 4px);
+        gap: 18px; z-index: 10; padding: 20px;
+      }
+      #menu .pennant {
+        font-family: "Georgia", "Times New Roman", serif;
+        font-size: 11px; letter-spacing: 0.4em; text-transform: uppercase;
+        color: var(--warm-gold); opacity: 0.7;
+      }
+      #menu h1 {
+        font-family: "Georgia", "Times New Roman", serif;
+        font-weight: 800;
+        font-size: clamp(34px, 6.5vw, 72px);
+        letter-spacing: 0.01em;
+        margin: 0;
+        color: var(--warm-gold);
+        text-shadow: 0 2px 0 #3a1610, 0 4px 20px rgba(244,213,141,0.15);
+        line-height: 1;
+      }
+      #menu h2 {
+        font-family: "Georgia", serif; font-weight: 500;
+        color: var(--brick); margin: -6px 0 0; font-size: 16px;
+        letter-spacing: 0.12em; text-transform: uppercase;
+      }
+      #menu p {
+        margin: 0; max-width: 560px; text-align: center;
+        font-size: 14px; line-height: 1.55; color: var(--muted);
+      }
+      #menu .rules {
+        display: grid; grid-template-columns: auto 1fr; gap: 6px 14px;
+        font-size: 12px; color: var(--muted); max-width: 520px;
+        padding: 14px 20px; border: 1px solid var(--line);
+        background: rgba(10,8,6,0.5); border-radius: 8px; margin-top: 4px;
+      }
+      #menu .rules b { color: var(--warm-gold); }
+      #menu .rules kbd {
+        display: inline-block; padding: 2px 6px; font-family: monospace;
+        background: #2b2118; color: var(--warm-gold);
+        border: 1px solid var(--line); border-radius: 3px;
+        font-size: 11px;
+      }
+      #menu input {
+        padding: 12px 16px;
+        background: #1a140e; border: 1px solid #3a2f20;
+        color: var(--ink); border-radius: 6px; width: min(320px, 90vw);
+        font-size: 16px; font-family: inherit;
+      }
+      #menu input:focus { outline: 2px solid var(--warm-gold); border-color: transparent; }
+      #menu button {
+        padding: 14px 34px; border-radius: 6px;
+        background: var(--brick); color: #18100a; border: 0;
+        font-family: "Georgia", serif; font-weight: 700; font-size: 17px;
+        cursor: pointer; letter-spacing: 0.04em;
+        box-shadow: 0 2px 0 #3a1610, 0 10px 30px rgba(194,97,58,0.25);
+        transition: transform 120ms ease, background 120ms ease, box-shadow 120ms ease;
+      }
+      #menu button:hover { background: #d97b52; transform: translateY(-1px); }
+      #menu button:active { transform: translateY(1px); box-shadow: 0 1px 0 #3a1610; }
+      #menu button:disabled { opacity: 0.6; cursor: default; transform: none; }
+      #menu .error { color: #ff8a80; font-size: 13px; min-height: 1.2em; }
+
+      /* ============================== HUD =============================== */
+      .hud-panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 8px 10px;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+      }
+
+      #hud {
+        position: fixed; left: 50%; top: 12px;
+        transform: translateX(-50%);
+        z-index: 5;
+        font-size: 12px;
+        pointer-events: none;
+      }
+      #hud .hud-help { background: rgba(12,9,6,0.75); padding: 6px 14px; border-radius: 20px; border: 1px solid var(--line); white-space: nowrap; }
+      #hud .hud-bang { color: var(--gold); font-weight: 700; padding: 0 2px; }
+
+      #score-card {
+        position: fixed; left: 12px; top: 12px; z-index: 6;
+        font-family: "Georgia", serif;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 12px 16px;
+        min-width: 180px;
+      }
+      #score-card .score-num {
+        font-size: 32px; font-weight: 700; color: var(--warm-gold);
+        line-height: 1; letter-spacing: 0.02em;
+      }
+      #score-card .score-num .unit {
+        font-size: 12px; font-weight: 400; letter-spacing: 0.1em;
+        color: var(--muted); margin-left: 6px; text-transform: uppercase;
+      }
+      #score-card .score-rank {
+        font-size: 13px; color: var(--brick); margin-top: 2px;
+        letter-spacing: 0.08em; text-transform: uppercase;
+      }
+      #score-card .score-sub { font-size: 11px; color: var(--muted); margin-top: 4px; font-family: monospace; }
+      #score-card .combo { color: var(--gold); font-weight: 700; }
+
+      #order-card {
+        position: fixed; left: 50%; top: 72px;
+        transform: translateX(-50%);
+        z-index: 5;
+        min-width: 260px; max-width: 380px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px; padding: 10px 14px;
+        font-family: "Georgia", serif;
+      }
+      #order-card .order-head {
+        font-size: 10px; letter-spacing: 0.22em; text-transform: uppercase;
+        color: var(--warm-gold); opacity: 0.8; margin-bottom: 2px;
+      }
+      #order-card .order-body { font-size: 15px; color: var(--ink); }
+      #order-card .order-body b { color: var(--warm-gold); }
+      #order-card .timer-bar {
+        margin-top: 6px;
+        height: 4px; background: rgba(244,213,141,0.15);
+        border-radius: 2px; overflow: hidden;
+      }
+      #order-card .timer-bar .fill {
+        height: 100%;
+        transition: width 0.2s linear, background 0.2s linear;
+      }
+      #order-card .order-foot { margin-top: 4px; font-size: 11px; color: var(--muted); font-family: monospace; }
+
+      #leaderboard {
+        position: fixed; right: 12px; top: 140px; z-index: 5;
+        font-family: "Georgia", serif; min-width: 180px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px; padding: 8px 12px;
+      }
+      #leaderboard .lb-head {
+        font-size: 11px; letter-spacing: 0.22em; text-transform: uppercase;
+        color: var(--warm-gold); opacity: 0.8; margin-bottom: 6px;
+        border-bottom: 1px solid var(--line); padding-bottom: 4px;
+      }
+      #leaderboard .lb-row {
+        display: grid; grid-template-columns: 20px 1fr auto;
+        gap: 6px; font-size: 12px; padding: 2px 0;
+        color: var(--muted); font-family: monospace;
+      }
+      #leaderboard .lb-row.me { color: var(--warm-gold); font-weight: 700; }
+      #leaderboard .lb-row .rank { opacity: 0.5; }
+      #leaderboard .lb-row .pts { color: var(--gold); }
+
+      #stamina-wrap {
+        position: fixed; left: 12px; bottom: 68px; z-index: 5;
+        width: 180px;
+        background: rgba(12,9,6,0.6);
+        padding: 4px 6px; border-radius: 4px;
+        border: 1px solid var(--line);
+      }
+      #stamina-wrap .label {
+        font-size: 9px; letter-spacing: 0.2em;
+        color: var(--muted); text-transform: uppercase; margin-bottom: 2px;
+      }
+      #stamina-bar-bg {
+        height: 4px; background: rgba(244,213,141,0.15); border-radius: 2px; overflow: hidden;
+      }
+      #stamina-bar {
+        height: 100%; width: 100%; background: var(--green);
+        transition: width 0.15s ease-out;
+      }
+      #stamina-bar.low { background: var(--red); }
+
+      /* ============================== CHAT ============================== */
+      #chat {
+        position: fixed; left: 12px; bottom: 12px; z-index: 5;
+        width: min(360px, 70vw);
+      }
+      #chat-log {
+        max-height: 150px; overflow: hidden;
+        display: flex; flex-direction: column; gap: 2px;
+        font-size: 12px; margin-bottom: 6px;
+        text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+      }
+      #chat-log .line {
+        background: rgba(12,9,6,0.62);
+        padding: 3px 8px; border-radius: 4px;
+        border-left: 2px solid transparent;
+        animation: slide-in 220ms ease-out;
+      }
+      #chat-log .line.system      { color: var(--muted); border-left-color: var(--warm-gold); }
+      #chat-log .line.system-good { color: var(--gold);   border-left-color: var(--green); font-weight: 500; }
+      #chat-log .line.system-bad  { color: #ffbfbf;        border-left-color: var(--red); }
+      @keyframes slide-in {
+        from { transform: translateX(-8px); opacity: 0; }
+        to   { transform: translateX(0); opacity: 1; }
+      }
+      #chat-input {
+        width: 100%; padding: 8px 10px;
+        background: rgba(12,9,6,0.9); color: var(--ink);
+        border: 1px solid #3a2f20; border-radius: 6px; font-size: 13px;
+        display: none; font-family: inherit;
+      }
+      #chat-input:focus { outline: 2px solid var(--warm-gold); border-color: transparent; }
+
+      /* ============================== MINIMAP =========================== */
+      #minimap {
+        position: fixed; right: 12px; top: 12px; z-index: 5;
+        border: 1px solid var(--line);
+        border-radius: 4px; image-rendering: pixelated;
+        background: #0a0805;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+      }
+      .credit {
+        position: fixed; right: 12px; bottom: 8px; z-index: 5;
+        font-size: 10px; opacity: 0.35;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="menu">
+      <div class="pennant">Anno Domini MCDXXX · Old Town</div>
+      <h1>Raekoja Courier</h1>
+      <h2>Tallinn Online</h2>
+      <p>Deliver parcels across the Old Town before they expire. Chain deliveries to build combo multipliers. Climb the merchants' ranks, from <b>Õpipoiss</b> apprentice to <b>Rae sündik</b>.</p>
+      <div class="rules">
+        <b>Move</b><span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> or arrow keys</span>
+        <b>Sprint</b><span><kbd>Shift</kbd> — drains stamina</span>
+        <b>Pickup</b><span>Walk onto any NPC showing a golden <span class="hud-bang" style="color:var(--warm-gold);font-weight:bold">!</span></span>
+        <b>Deliver</b><span>Walk onto the marked destination NPC before the timer runs out</span>
+        <b>Chat</b><span><kbd>Enter</kbd> to open · <kbd>Esc</kbd> to cancel</span>
+      </div>
+      <input id="name" maxlength="16" placeholder="your merchant's name" autocomplete="off" />
+      <button id="play">Enter the Old Town</button>
+      <div class="error" id="err"></div>
+    </div>
+
+    <div id="app"></div>
+
+    <div id="score-card" style="display:none"></div>
+    <div id="order-card" style="display:none"></div>
+    <div id="leaderboard" style="display:none"></div>
+    <div id="hud" style="display:none"></div>
+
+    <div id="stamina-wrap" style="display:none">
+      <div class="label">Stamina</div>
+      <div id="stamina-bar-bg"><div id="stamina-bar"></div></div>
+    </div>
+
+    <div id="chat" style="display:none">
+      <div id="chat-log"></div>
+      <input id="chat-input" maxlength="140" placeholder="say something… (Esc to cancel)" />
+    </div>
+    <canvas id="minimap" width="208" height="160" style="display:none"></canvas>
+    <div class="credit">inspired by Tallinn · Raekoja plats · Colyseus + Phaser</div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

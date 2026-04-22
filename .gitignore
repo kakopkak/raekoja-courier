@@ -1,0 +1,22 @@
+node_modules
+dist
+*.log
+.env
+.env.*
+.DS_Store
+
+# deploy artifacts + secrets — NEVER commit
+deploy/bundle.tar.gz
+deploy/release.tar.gz
+deploy/user-data.sh
+deploy/user-data.yml
+deploy/last-run.log
+deploy/known_hosts
+deploy/id_ed25519
+deploy/id_ed25519.pub
+deploy/.secret
+deploy/.stage
+
+# local smoke tests
+server/smoke*.mjs
+server/smokeprod.mjs
