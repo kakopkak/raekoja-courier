@@ -1,5 +1,28 @@
 import Phaser from "phaser";
 import { Client, Room, getStateCallbacks } from "colyseus.js";
+
+// ---------------------------------------------------------------------------
+// Global error surface — if anything throws, we want to SEE it, not get a
+// silently black viewport. Runs before anything else.
+// ---------------------------------------------------------------------------
+const errBanner = (() => {
+  const el = document.getElementById("err-banner");
+  return {
+    show(prefix: string, msg: string) {
+      if (!el) return;
+      el.style.display = "block";
+      el.textContent = `${prefix}\n${msg}\n\n${el.textContent || ""}`.slice(0, 6000);
+    },
+  };
+})();
+window.addEventListener("error", (e) => {
+  errBanner.show("[error]", `${e.message}\n${e.error?.stack || ""}`);
+  // eslint-disable-next-line no-console
+  console.error("[tallinn]", e.error || e.message);
+});
+window.addEventListener("unhandledrejection", (e) => {
+  errBanner.show("[unhandled promise]", `${e.reason?.message || e.reason}\n${e.reason?.stack || ""}`);
+});
 import {
   generateMap,
   generateBuildings,
@@ -225,10 +248,20 @@ class GameScene extends Phaser.Scene {
 
   // =======================================================================
   create() {
+    try {
+      this.createInner();
+    } catch (err: any) {
+      errBanner.show("[create]", `${err?.message || err}\n${err?.stack || ""}`);
+      throw err;
+    }
+  }
+
+  private createInner() {
     const worldPxW = MAP_W * TILE_SIZE;
     const worldPxH = MAP_H * TILE_SIZE;
 
-    // 1. Render the static world into a big RenderTexture (runs once).
+    // 1. Render the static world once into a cached texture, then display as Image.
+    //    This avoids relying on the deprecated RenderTexture game-object path.
     this.drawWorldInto(worldPxW, worldPxH);
 
     // 2. Cache NPC defs but wait for state for exact positions.
@@ -374,6 +407,12 @@ class GameScene extends Phaser.Scene {
   // =======================================================================
   update(_time: number, deltaMs: number) {
     if (!room) return;
+    try { this.updateInner(deltaMs); }
+    catch (err: any) { errBanner.show("[update]", `${err?.message}\n${err?.stack || ""}`); throw err; }
+  }
+
+  private updateInner(deltaMs: number) {
+    if (!room) return;
     const dt = Math.min(0.05, deltaMs / 1000);
 
     // --- Input gathering ---
@@ -457,11 +496,12 @@ class GameScene extends Phaser.Scene {
   }
 
   // =======================================================================
-  // World render (one-shot into a RenderTexture)
+  // World render — bake tiles+buildings+props into a cached texture once,
+  // then show it as a single Image. No RenderTexture dependency.
   // =======================================================================
   private drawWorldInto(worldPxW: number, worldPxH: number) {
-    const rt = this.add.renderTexture(0, 0, worldPxW, worldPxH).setOrigin(0, 0).setDepth(0);
-    const gfx = this.make.graphics({}, false);
+    const gfx = this.add.graphics({ x: 0, y: 0 });
+    gfx.setVisible(false);
 
     // Base tiles.
     for (let y = 0; y < MAP_H; y++) {
@@ -486,8 +526,13 @@ class GameScene extends Phaser.Scene {
       }
     }
 
-    rt.draw(gfx, 0, 0);
+    // Bake to a cached texture, then display it as a single Image.
+    // generateTexture: async-safe, universally supported across Phaser 3.x.
+    const key = "__tallinn_world";
+    if (this.textures.exists(key)) this.textures.remove(key);
+    gfx.generateTexture(key, worldPxW, worldPxH);
     gfx.destroy();
+    this.add.image(0, 0, key).setOrigin(0, 0).setDepth(0);
 
     // Building labels (drawn as text objects, not baked into RT).
     for (const b of this.buildings) {
